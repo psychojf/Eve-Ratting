@@ -1,0 +1,179 @@
+================================================================
+ EVE RATTING — HOW TO USE
+================================================================
+
+A passive desktop dashboard for EVE Online PvE pilots. It reads
+the log files the EVE client writes to disk and turns them into a
+live overlay (DPS, ISK/h, bounties, missions, anomalies, EWAR).
+
+It does NOT touch the EVE client, network traffic or memory.
+
+----------------------------------------------------------------
+ 1. WHAT YOU NEED
+----------------------------------------------------------------
+
+  - Windows 10 or 11
+  - Python 3.9 or newer    (https://www.python.org/downloads/)
+    -> During install, tick "Add Python to PATH"
+  - The EVE Online client (gamelogs are enabled by default)
+
+  Optional but recommended:
+  - pip install pystray Pillow pyperclip
+    (system tray icon + clipboard paste support)
+
+  Or, from the project folder:
+    pip install -r requirements.txt
+
+----------------------------------------------------------------
+ 2. MAKE SURE EVE IS LOGGING
+----------------------------------------------------------------
+
+  EVE writes logs to:
+    %USERPROFILE%\Documents\EVE\logs\Gamelogs
+    %USERPROFILE%\Documents\EVE\logs\Chatlogs
+
+  Both folders should already exist after you have logged in to
+  the game at least once. If they are empty:
+
+  In the EVE client, open the Settings (ESC) menu and check that
+  "Log combat interactions to file" and chat logging are enabled.
+
+----------------------------------------------------------------
+ 3. RUNNING EVE RATTING
+----------------------------------------------------------------
+
+  Open a terminal in the project folder and run:
+
+      python ratting.py
+
+  On first launch the app will:
+    - create ratting_config.json next to the script
+    - try to find your EVE log directories
+    - start watching for the latest gamelog file
+
+  Undock the EVE client window or move the dashboard to a second
+  monitor — it stays on top by default.
+
+----------------------------------------------------------------
+ 4. THE DASHBOARD AT A GLANCE
+----------------------------------------------------------------
+
+  TIMER         Session length, with Play / Pause / Stop / Clear
+  DPS OUT/IN    Sliding 15-second window
+  HITS          Total hits dealt / received, plus misses
+  BOUNTIES      Gross bounties this session
+  TAX           Configurable bounty tax (default 12.5%)
+  LOOT          Estimated value of looted faction modules
+  NET ISK       Bounties - tax + loot
+  ISK/HOUR      Net ISK extrapolated to one hour
+  KILLS         NPC kill counter
+  MISSIONS      Current mission name + count + storyline progress
+  ANOMALIES     Current site time + completed sites + averages
+  ALERTS        Last few EWAR / escalation / dread spawn warnings
+  STANDINGS     Faction standing changes captured this session
+
+  Right-click most panels to detach them into their own
+  always-on-top window.
+
+----------------------------------------------------------------
+ 5. CONTROLS
+----------------------------------------------------------------
+
+  PLAY      Start the session timer and begin parsing
+  PAUSE     Stop the timer without losing data
+  STOP      Save the session to history
+  CLEAR     Wipe the current session (asks first)
+  HISTORY   Open the past sessions browser
+  SETTINGS  Open the settings window
+
+----------------------------------------------------------------
+ 6. SETTINGS
+----------------------------------------------------------------
+
+  - Gamelog folder        path to EVE\logs\Gamelogs
+  - Chatlog folder        path to EVE\logs\Chatlogs
+  - Tax rate %            your corp / NPC bounty tax
+  - Theme                 22+ EVE / faction palettes
+  - Poll interval (ms)    how often to re-tail the log
+  - Start minimized       launch directly to the system tray
+  - Always on top         toggle the topmost flag
+
+  Settings are saved to ratting_config.json next to the script.
+
+----------------------------------------------------------------
+ 7. HISTORY
+----------------------------------------------------------------
+
+  Each STOP saves a row to ratting_history.json:
+    date, character, duration, net ISK, ISK/h,
+    kills, sites cleared, missions done
+
+  Open the History window to browse, sort and review past
+  sessions.
+
+----------------------------------------------------------------
+ 8. SYSTEM TRAY (OPTIONAL)
+----------------------------------------------------------------
+
+  If pystray and Pillow are installed, closing the main window
+  minimizes Eve Ratting to the system tray. Right-click the tray
+  icon for "Show Dashboard" / "Exit".
+
+  Without those packages the close button just exits.
+
+----------------------------------------------------------------
+ 9. TROUBLESHOOTING
+----------------------------------------------------------------
+
+  "No log file found"
+    -> Check the Gamelog folder path in Settings.
+    -> Confirm the folder actually contains files like
+       20251231_180000_12345.txt
+    -> Make sure you have logged in to EVE at least once with the
+       current character.
+
+  "Bounties stay at zero"
+    -> EVE only writes bounty lines when an NPC dies AND you are
+       on the killmail. Pure logi/booster characters will not see
+       bounties.
+
+  "Mission name not detected"
+    -> Eve Ratting reads chatlogs for "You have accepted the
+       mission ...". Make sure your chatlog folder is set and
+       that mission agent conversations are being logged.
+
+  Theme colors look wrong
+    -> Pick "EVE Online (Default)" in Settings to reset.
+
+  The window is hidden behind EVE
+    -> Toggle "Always on top" in Settings, or click the Eve
+       Ratting tray icon if you have pystray installed.
+
+  Crash on startup
+    -> Run from a terminal (python ratting.py) so you can see
+       the traceback, then open a GitHub issue with it.
+
+----------------------------------------------------------------
+ 10. UNINSTALL
+----------------------------------------------------------------
+
+  Eve Ratting installs nothing system-wide. To remove it:
+
+    1. Delete the project folder.
+    2. (Optional) pip uninstall pystray Pillow pyperclip
+
+  All settings, history and caches live next to ratting.py and
+  go away with the folder.
+
+----------------------------------------------------------------
+ 11. SUPPORT
+----------------------------------------------------------------
+
+  Issues and feature requests:
+    https://github.com/psychojf/Eve-Ratting/issues
+
+  Security disclosures:
+    See SECURITY.md
+
+  Fly safe. o7
+================================================================

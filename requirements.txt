@@ -1,0 +1,18 @@
+# Eve Ratting — runtime dependencies
+#
+# All dependencies below are OPTIONAL. Eve Ratting runs on a stock Python
+# 3.9+ install (Tkinter is part of the standard library on python.org
+# builds) and gracefully degrades when these packages are missing.
+#
+# Install everything with:
+#   pip install -r requirements.txt
+
+# System tray icon support (close-to-tray, "Show Dashboard" / "Exit" menu).
+pystray>=0.19.4
+
+# Required by pystray for the tray icon image, and used by Eve Ratting to
+# build a fallback icon at runtime.
+Pillow>=10.0.0
+
+# Clipboard paste support (used by the killmail / log paste helpers).
+pyperclip>=1.8.2
