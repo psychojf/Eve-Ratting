@@ -87,3 +87,6 @@ If you find a security issue, please follow the disclosure process in [SECURITY.
 ## Disclaimer
 
 Eve Ratting only reads local log files written by the EVE Online client. It does not interact with the game client memory, network traffic, or the official EVE API. Use at your own risk.
+
+**PLEASE NOTE**
+the missionning part of the dashboard is not done testing but should be functionnal...if ever you noticed a bug let me know please
