@@ -224,7 +224,7 @@ RE_DM = re.compile(r'\(combat\)\s+Your\s+(.+?)\s+misses\s+([\w\s\'-]+?)\s+comple
 
 # ── Bounty payout pattern ────────────────────────────────────────────
 # Handles both plain and HTML-tagged bounty lines
-RE_BT = re.compile(r'\(bounty\)\s*(?:<[^>]+>)*([\d\s]+)\s*ISK.*?added\s+to\s+next\s+bounty\s+payout', re.I)
+RE_BT = re.compile(r'\(bounty\)\s*(?:<[^>]+>)*([\d\s,]+)\s*ISK.*?added\s+to\s+next\s+bounty\s+payout', re.I)
 
 # ── Faction/loot keyword pattern ─────────────────────────────────────
 RE_FACTION_ITEM = re.compile(
@@ -261,7 +261,7 @@ RE_CHATLOG_FN = re.compile(r'^Agent_.*\.txt$',                         re.I)
 def shtml(t): return re.sub(r'<[^>]+>', '', t).strip()
 
 # Parse un entier en ignorant les espaces (ex: "1 234 567" → 1234567)
-def pnum(s):  return int(re.sub(r'\s+', '', s.strip()))
+def pnum(s):  return int(re.sub(r'[\s,]+', '', s.strip()))
 
 # Formate un montant ISK en notation courte (K/M/B)
 def fisk(v):
