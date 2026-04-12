@@ -187,8 +187,29 @@ CONFIG_FILE  = os.path.join(_BASE, "ratting_config.json")
 HISTORY_FILE = os.path.join(_BASE, "ratting_history.json")
 PRICE_CACHE  = os.path.join(_BASE, "ratting_prices.json")
 NAMEID_CACHE = os.path.join(_BASE, "ratting_nameids.json")
-DEF_PATH     = os.path.join(os.path.expanduser("~"), "Documents", "EVE", "logs", "Gamelogs")
-DEF_CHAT     = os.path.join(os.path.expanduser("~"), "Documents", "EVE", "logs", "Chatlogs")
+def _find_eve_log_path(subdir):
+    """Return the first existing EVE log path across Windows, Linux native, and Linux/Proton."""
+    candidates = [
+        # Windows / macOS native
+        os.path.join(os.path.expanduser("~"), "Documents", "EVE", "logs", subdir),
+        # Linux native client
+        os.path.join(os.path.expanduser("~"), ".eve", "sharedcache", "tq", "logs", subdir),
+        # Linux Steam / Proton (default Steam library)
+        os.path.join(os.path.expanduser("~"), ".local", "share", "Steam",
+                     "steamapps", "compatdata", "8500", "pfx", "drive_c",
+                     "users", "steamuser", "My Documents", "EVE", "logs", subdir),
+        # Linux Steam with custom library on second drive
+        os.path.join("/mnt", "ssd", "SteamLibrary", "steamapps", "compatdata",
+                     "8500", "pfx", "drive_c", "users", "steamuser",
+                     "My Documents", "EVE", "logs", subdir),
+    ]
+    for p in candidates:
+        if os.path.isdir(p):
+            return p
+    return candidates[0]  # fall back to Windows default even if missing
+
+DEF_PATH     = _find_eve_log_path("Gamelogs")
+DEF_CHAT     = _find_eve_log_path("Chatlogs")
 DEF_POLL     = 500
 DEF_TAX      = 12.5
 DEF_ALPHA    = 0.85  # Default set to 85%
@@ -224,7 +245,7 @@ RE_DM = re.compile(r'\(combat\)\s+Your\s+(.+?)\s+misses\s+([\w\s\'-]+?)\s+comple
 
 # ── Bounty payout pattern ────────────────────────────────────────────
 # Handles both plain and HTML-tagged bounty lines
-RE_BT = re.compile(r'\(bounty\)\s*(?:<[^>]+>)*([\d\s,]+)\s*ISK.*?added\s+to\s+next\s+bounty\s+payout', re.I)
+RE_BT = re.compile(r'\(bounty\)\s*(?:<[^>]+>)*([\d\s,.]+)\s*ISK.*?added\s+to\s+next\s+bounty\s+payout', re.I)
 
 # ── Faction/loot keyword pattern ─────────────────────────────────────
 RE_FACTION_ITEM = re.compile(
@@ -261,7 +282,7 @@ RE_CHATLOG_FN = re.compile(r'^Agent_.*\.txt$',                         re.I)
 def shtml(t): return re.sub(r'<[^>]+>', '', t).strip()
 
 # Parse un entier en ignorant les espaces (ex: "1 234 567" → 1234567)
-def pnum(s):  return int(re.sub(r'[\s,]+', '', s.strip()))
+def pnum(s):  return int(re.sub(r'[\s,.]+', '', s.strip()))
 
 # Formate un montant ISK en notation courte (K/M/B)
 def fisk(v):
@@ -1120,6 +1141,8 @@ class App:
         self._frozen = None
         self._session_saved = False
         self._anom_paused_secs = 0
+        self._anom_last_wall   = 0.0  # time.monotonic() of last combat event (timezone-immune gap detection)
+        self._anom_start_wall  = 0.0  # time.monotonic() when current anomaly started
         self._btn_sets = []
 
         self._isk_detached = False
@@ -3034,8 +3057,8 @@ class App:
             d.pkr = dr
 
         # Freeze anomaly timer (save current site elapsed time)
-        if d.anom_current and d.anom_current["start"]:
-            self._anom_paused_secs = (datetime.now(timezone.utc) - d.anom_current["start"]).total_seconds()
+        if d.anom_current and self._anom_start_wall:
+            self._anom_paused_secs = time.monotonic() - self._anom_start_wall
 
         a_n, a_avg_t, a_avg_i, a_best, _ = self._anom_stats()
         a_cur = self._anom_paused_secs
@@ -3487,6 +3510,8 @@ class App:
                 # Reset anomaly gap reference so tracker doesn't see a gap
                 if self.data.anom_current and self.data.anom_last_combat:
                     self.data.anom_last_combat = datetime.now(timezone.utc)
+                    self._anom_last_wall  = time.monotonic()
+                    self._anom_start_wall = time.monotonic() - self._anom_paused_secs
         self._open_chatlog()
 
         # Also skip accumulated chatlog lines on resume
@@ -3508,8 +3533,8 @@ class App:
                 self.data.t0 = None
 
             # Freeze anomaly current site timer
-            if self.data.anom_current and self.data.anom_current["start"]:
-                self._anom_paused_secs = (datetime.now(timezone.utc) - self.data.anom_current["start"]).total_seconds()
+            if self.data.anom_current and self._anom_start_wall:
+                self._anom_paused_secs = time.monotonic() - self._anom_start_wall
             else:
                 self._anom_paused_secs = 0
         elif self._st == "paused":
@@ -3613,7 +3638,9 @@ class App:
                 d.anom_current = None
         if d.anom_current is None:
             d.anom_current = {"start": ts, "end": None, "kills": 0, "isk": 0, "dmg_d": 0, "dmg_r": 0, "hits": 0}
+            self._anom_start_wall = time.monotonic()
         d.anom_last_combat = ts
+        self._anom_last_wall = time.monotonic()
 
     # Ajoute les dégâts infligés à l'anomalie en cours
     def _anom_add_dmg_out(self, ts, amount):
@@ -3647,8 +3674,8 @@ class App:
     # Vérifie si le gap de combat dépasse le seuil et clôture l'anomalie si nécessaire
     def _anom_check_gap(self):
         d = self.data
-        if d.anom_current and d.anom_last_combat:
-            gap = (datetime.now(timezone.utc) - d.anom_last_combat).total_seconds()
+        if d.anom_current and self._anom_last_wall:
+            gap = time.monotonic() - self._anom_last_wall
             if gap > self.anom_gap:
                 d.anom_current["end"] = d.anom_last_combat
                 d.anom_completed.append(d.anom_current)
@@ -3666,7 +3693,7 @@ class App:
             avg_time = 0
         avg_isk  = sum(a["isk"] for a in completed) / n if n > 0 else 0
         best_isk = max((a["isk"] for a in completed), default=0)
-        cur_secs = (datetime.now(timezone.utc) - d.anom_current["start"]).total_seconds() if (d.anom_current and d.anom_current["start"]) else 0
+        cur_secs = (time.monotonic() - self._anom_start_wall) if (d.anom_current and self._anom_start_wall) else 0
         return n, avg_time, avg_isk, best_isk, cur_secs
 
 if __name__ == "__main__":
