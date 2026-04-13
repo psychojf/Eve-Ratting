@@ -10,8 +10,9 @@ if sys.stdout is not None:
     sys.stdout.reconfigure(encoding='utf-8')
 
 # -- Dependency Check with Logging --
-_TRAY_OK = False
-_CLIP_OK = False
+_TRAY_OK  = False
+_CLIP_OK  = False
+_LOOT_SPIN = ("◐", "◓", "◑", "◒")   # spinner frames for clipboard loading indicator
 
 try:
     import pyperclip
@@ -1129,10 +1130,15 @@ class App:
         self._chat_fp = 0
 
         # Clipboard tracker state
-        self._last_clipboard = ""
-        self._global_prices = {}
+        self._last_clipboard  = ""
+        self._global_prices   = {}
         self._jita_price_cache = {}     # Session cache for Jita lookups
         self._name_to_id_cache = self._load_nameid_cache()
+
+        # Loot loading indicator state
+        self._loot_loading    = False
+        self._loot_anim_job   = None
+        self._loot_anim_step  = 0
 
         # ── Load or Download Market Prices (24h disk cache) ──
         threading.Thread(target=self._download_market_data, daemon=True).start()
@@ -1280,6 +1286,7 @@ class App:
             # Only parse if it looks like EVE inventory + is a new copy
             if content and "\t" in content and content != self._last_clipboard:
                 self._last_clipboard = content
+                self._loot_anim_start()   # show spinner immediately (main thread)
                 threading.Thread(target=self._process_loot_copy, args=(content,), daemon=True).start()
         except Exception:
             pass
@@ -1342,9 +1349,12 @@ class App:
                 
             total_session_loot += (price * qty)
         
+        now_str = datetime.now().strftime("%H:%M:%S")
         if total_session_loot > 0:
-            now_str = datetime.now().strftime("%H:%M:%S")
             self.root.after(0, lambda amt=total_session_loot, ts=now_str: self._apply_loot(amt, ts))
+        else:
+            # Nothing valued — stop spinner without flashing green
+            self.root.after(0, lambda: self._loot_anim_stop(False))
 
     # Pulse visuel sur le cadre d'alerte (pour les événements EWAR)
     def _flash_alert(self):
@@ -1379,6 +1389,9 @@ class App:
 
     # Applique la valeur de loot calculée aux données de session (thread principal)
     def _apply_loot(self, amount, now_str):
+
+        # Stop spinner and flash green to confirm the find
+        self._loot_anim_stop(True)
 
         # Main thread — safe to update data + UI
         self.data.loot_val += amount
@@ -1428,6 +1441,51 @@ class App:
         self.data.alerts.append((now_str, "LOOT", f"Added {fisk(amount)} loot"))
         # Refresh alert display
         self._update_alert_labels()
+
+    # ── Loot loading animation (main thread only) ─────────────────────
+
+    def _loot_anim_start(self):
+        """Begin spinning 'Searching…' on the LOOT ESTIMATE label."""
+        self._loot_loading   = True
+        self._loot_anim_step = 0
+        if self._loot_anim_job:
+            self.root.after_cancel(self._loot_anim_job)
+            self._loot_anim_job = None
+        self._loot_anim_tick()
+
+    def _loot_anim_tick(self):
+        """Advance one spinner frame (reschedules itself while loading)."""
+        if not self._loot_loading:
+            return
+        try:
+            spin = _LOOT_SPIN[self._loot_anim_step % len(_LOOT_SPIN)]
+            self.ll.config(text=f"{spin} Searching...", fg=CW)
+        except Exception:
+            pass
+        self._loot_anim_step += 1
+        self._loot_anim_job = self.root.after(120, self._loot_anim_tick)
+
+    def _loot_anim_stop(self, found):
+        """Stop the spinner.  If found=True, flash bright green then restore."""
+        self._loot_loading = False
+        if self._loot_anim_job:
+            self.root.after_cancel(self._loot_anim_job)
+            self._loot_anim_job = None
+        if found:
+            try:
+                self.ll.config(fg="#39FF14")   # bright-green confirmation flash
+            except Exception:
+                pass
+            self.root.after(500, lambda: self._loot_label_restore_fg())
+        else:
+            self._loot_label_restore_fg()
+
+    def _loot_label_restore_fg(self):
+        """Restore the loot label to its normal colour."""
+        try:
+            self.ll.config(fg=CI)
+        except Exception:
+            pass
 
     # ── Resize main window to fit content ────────────────────────────
     # Redimensionne la fenêtre principale pour s'adapter au contenu
@@ -2603,7 +2661,8 @@ class App:
             self.gl.config(text=f"{fiskf(d.bg)} ISK")
             self.tl.config(text=f"-{fiskf(d.bg*d.tax)} ISK")
             self.bl.config(text=str(d.bc))
-            self.ll.config(text=f"{fiskf(d.loot_val)} ISK")
+            if not self._loot_loading:   # don't overwrite the spinner
+                self.ll.config(text=f"{fiskf(d.loot_val)} ISK")
             self.tnl.config(text=f"{fiskf(d.bg*(1-d.tax) + d.loot_val)} ISK")
 
     # Met à jour les labels DPS out/in (live ou frozen)
