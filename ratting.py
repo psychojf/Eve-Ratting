@@ -282,7 +282,9 @@ RE_CHATLOG_FN = re.compile(r'^Agent_.*\.txt$',                         re.I)
 def shtml(t): return re.sub(r'<[^>]+>', '', t).strip()
 
 # Parse un entier en ignorant les espaces (ex: "1 234 567" → 1234567)
-def pnum(s):  return int(re.sub(r'[\s,.]+', '', s.strip()))
+def pnum(s):
+    cleaned = re.sub(r'[\s,.]+', '', s.strip())
+    return int(cleaned) if cleaned else 0
 
 # Formate un montant ISK en notation courte (K/M/B)
 def fisk(v):
@@ -2950,27 +2952,31 @@ class App:
     # ── Polling loop (reads new log data) ────────────────────────────
     # Boucle de lecture des logs et chatlog (s'exécute toutes les poll_ms ms)
     def _poll(self):
-        if self._st == "running":
-            cid = self._cid()
-            if cid and cid in self._chars:
-                fp = self._chars[cid]["file"]
-                if fp != self.cf:
-                    self._load(cid)
+        try:
+            if self._st == "running":
+                cid = self._cid()
+                if cid and cid in self._chars:
+                    fp = self._chars[cid]["file"]
+                    if fp != self.cf:
+                        self._load(cid)
 
-                # Full rescan only every 10 seconds
-                if time.time() - self._last_full_scan > 10:
-                    self._scan()
-                    self._last_full_scan = time.time()
+                    # Full rescan only every 10 seconds
+                    if time.time() - self._last_full_scan > 10:
+                        self._scan()
+                        self._last_full_scan = time.time()
 
-            self._read()
-            latest_chat = self._find_latest_chatlog()
-            if latest_chat and latest_chat != self._chat_file:
-                self._open_chatlog()
-            self._read_chatlog()
-            self._check_clipboard()
+                self._read()
+                latest_chat = self._find_latest_chatlog()
+                if latest_chat and latest_chat != self._chat_file:
+                    self._open_chatlog()
+                self._read_chatlog()
+                self._check_clipboard()
 
-        elif self._st == "paused":
-            self._check_clipboard()
+            elif self._st == "paused":
+                self._check_clipboard()
+
+        except Exception:
+            pass
 
         self.root.after(self.poll_ms, self._poll)
 
