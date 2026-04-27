@@ -146,7 +146,7 @@ THEME_NAMES = list(THEMES.keys())
 def apply_theme_colors(name):
     global BG, BG_P, BG_H, BG_C, BG_POP, BD, BDG
     global T0, T1, TB, TD, CD, CR, CG, CI, CT, CK, CW, CM
-    global CA, CP, CS, CH, C_DETACH, C_MSN, C_ALERT, C_ESCAL, C_ANOM
+    global CA, CP, CS, CH, C_DETACH, C_MSN, C_ALERT, C_ESCAL, C_ANOM, C_EWAR
     t = THEMES.get(name, THEMES[THEME_DEFAULT])
     BG = t["BG"]
     BG_P = t["BG_P"]
@@ -784,10 +784,10 @@ class Settings:
             f"+{self.w.winfo_x() + e.x - self._dx}+{self.w.winfo_y() + e.y - self._dy}"))
         hdr.bind("<ButtonRelease-1>", lambda e: self._save_geo())
 
-        tk.Frame(hdr, bg=CW, width=3).pack(side="left", fill="y")
+        tk.Frame(hdr, bg=T0, width=3).pack(side="left", fill="y")
         tk.Label(hdr, text="  \u2699 SETTINGS",
                  font=tkfont.Font(family="Consolas", size=10, weight="bold"),
-                 bg=BG_H, fg=CW).pack(side="left")
+                 bg=BG_H, fg=T0).pack(side="left")
         xb = tk.Label(hdr, text="\u2715",
                       font=tkfont.Font(family="Consolas", size=12, weight="bold"),
                       bg=BG_H, fg=TD, padx=8, cursor="hand2")
@@ -938,9 +938,7 @@ class Settings:
         a._scan()
 
         if theme_changed:
-            a._sw = None
-            self.w.destroy()
-            a._rebuild_ui()
+            a._apply_theme_live()   # recolour in-place — no flicker, window stays open
 
     # Sauvegarde et ferme la fenêtre de paramètres
     def _close(self):
@@ -1491,6 +1489,7 @@ class App:
     # Redimensionne la fenêtre principale pour s'adapter au contenu
     def _fit(self):
         self.root.update_idletasks()
+        self.root.update_idletasks()  # second pass needed on Linux/X11 for nested frame heights
         h = self._body.winfo_reqheight() + 32
 
         # Use saved geometry if available, otherwise use defaults
@@ -1759,8 +1758,8 @@ class App:
             hdr_f = tk.Frame(parent, bg=BG_P, height=20)
             hdr_f.pack(fill="x")
             hdr_f.pack_propagate(False)
-            tk.Frame(hdr_f, bg=C_ALERT, width=3).pack(side="left", fill="y")
-            tk.Label(hdr_f, text="  ALERTS", font=F8B, bg=BG_P, fg=C_ALERT).pack(side="left")
+            tk.Frame(hdr_f, bg=T0, width=3).pack(side="left", fill="y")
+            tk.Label(hdr_f, text="  ALERTS", font=F8B, bg=BG_P, fg=T0).pack(side="left")
 
             # Clear alerts button
             clr_btn = tk.Label(hdr_f, text="CLR", font=F8B, bg=BG_P, fg=TD, cursor="hand2", padx=4)
@@ -1794,7 +1793,7 @@ class App:
         tk.Label(self._alert_frame, text="  No alerts", font=F9, bg=BG_P, fg=CM, anchor="w").pack(anchor="w")
         self._last_alert_key = None  # Force redraw on next tick
 
-        # For detached window: track scaling
+        # For detached window: track font scaling on resize
         if detached:
             self._alert_det_frame = self._alert_frame
             self._alert_det_font_size = 9
@@ -1838,8 +1837,8 @@ class App:
             hdr_f = tk.Frame(parent, bg=BG_P, height=20)
             hdr_f.pack(fill="x")
             hdr_f.pack_propagate(False)
-            tk.Frame(hdr_f, bg=CI, width=3).pack(side="left", fill="y")
-            tk.Label(hdr_f, text="  ISK TRACKER", font=F8B, bg=BG_P, fg=CI).pack(side="left")
+            tk.Frame(hdr_f, bg=CD, width=3).pack(side="left", fill="y")
+            tk.Label(hdr_f, text="  ISK TRACKER", font=F8B, bg=BG_P, fg=CD).pack(side="left")
 
             # ON/OFF button
             self._isk_on_btn = tk.Label(hdr_f, text="ON" if self._isk_enabled else "OFF",
@@ -3412,6 +3411,76 @@ class App:
                 self._load(c)
 
     # Reconstruit entièrement l'interface en appliquant le thème courant sans perdre l'état
+    def _apply_theme_live(self):
+        """Re-colour every widget in-place — no rebuild, no flicker."""
+
+        # 1. Snapshot current (old) palette BEFORE updating globals
+        old = [BG, BG_P, BG_H, BG_C, BG_POP, BD, BDG,
+               T0, T1, TB, TD, CD, CR, CG, CI, CT, CK, CW, CM,
+               CA, CP, CS, CH, C_DETACH, C_MSN, C_ALERT, C_ESCAL, C_ANOM, C_EWAR]
+
+        # 2. Update globals to the new theme
+        apply_theme_colors(self._current_theme)
+
+        # 3. New palette (same order)
+        new = [BG, BG_P, BG_H, BG_C, BG_POP, BD, BDG,
+               T0, T1, TB, TD, CD, CR, CG, CI, CT, CK, CW, CM,
+               CA, CP, CS, CH, C_DETACH, C_MSN, C_ALERT, C_ESCAL, C_ANOM, C_EWAR]
+
+        # 4. Build old-hex → new-hex replacement map (only changed entries)
+        remap = {o.lower(): n for o, n in zip(old, new) if o.lower() != n.lower()}
+        if not remap:
+            return
+
+        # 5. Walk every widget and swap matching colours
+        PROPS = ('bg', 'fg', 'highlightbackground', 'highlightcolor',
+                 'insertbackground', 'selectbackground',
+                 'activebackground', 'activeforeground')
+
+        def _walk(widget):
+            for prop in PROPS:
+                try:
+                    v = widget.cget(prop)
+                    if isinstance(v, str) and v.lower() in remap:
+                        widget.config(**{prop: remap[v.lower()]})
+                except Exception:
+                    pass
+            for child in widget.winfo_children():
+                _walk(child)
+
+        # Main window
+        _walk(self.root)
+        self.root.configure(bg=BG,
+                            highlightbackground=BDG, highlightcolor=BDG)
+
+        # Detached windows
+        for attr in ('_isk_window', '_dps_window', '_msn_window',
+                     '_anom_window', '_alert_window'):
+            win = getattr(self, attr, None)
+            if win:
+                try:
+                    if win.w.winfo_exists():
+                        _walk(win.w)
+                        win.w.configure(bg=BG,
+                                        highlightbackground=BDG,
+                                        highlightcolor=BDG)
+                except Exception:
+                    pass
+
+        # Settings / History Toplevels (if open)
+        for attr in ('_sw', '_hw'):
+            obj = getattr(self, attr, None)
+            if obj:
+                try:
+                    if obj.w.winfo_exists():
+                        _walk(obj.w)
+                except Exception:
+                    pass
+
+        # 6. Refresh ttk combobox style and button states
+        self._style()
+        self._update_buttons()
+
     def _rebuild_ui(self):
 
         # Full UI rebuild with current theme
@@ -3613,7 +3682,7 @@ class App:
             self._isk_detached = True
             self._isk_container.grid_remove()
             self._sep_isk_msn.grid_remove()
-            self._isk_window = DetachedWindow(self.root, self, "ISK TRACKER", CI, "isk", lambda parent, detached: self._build_isk(parent, detached=True))
+            self._isk_window = DetachedWindow(self.root, self, "ISK TRACKER", CD, "isk", lambda parent, detached: self._build_isk(parent, detached=True))
             self._fit()
         elif section == "dps" and not self._dps_detached:
             self._dps_detached = True
@@ -3637,7 +3706,7 @@ class App:
             self._alert_detached = True
             self._alert_container.grid_remove()
             self._sep_alert_isk.grid_remove()
-            self._alert_window = DetachedWindow(self.root, self, "ALERTS", C_ALERT, "alert", lambda parent, detached: self._build_alerts(parent, detached=True))
+            self._alert_window = DetachedWindow(self.root, self, "ALERTS", T0, "alert", lambda parent, detached: self._build_alerts(parent, detached=True))
             self._fit()
 
     # Réintègre un panneau détaché dans la fenêtre principale et reconstruit son contenu
