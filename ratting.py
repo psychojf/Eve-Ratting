@@ -1136,7 +1136,6 @@ class CharacterWindow:
         self._sw  = None
         self._hw = None
         self._calc_dots = 0
-        self._tray_icon = None
 
         self._chat_file = None
         self._chat_fh = None
@@ -1233,9 +1232,6 @@ class CharacterWindow:
         if self.char_cfg.get("alert_detached", False):
             self._detach("alert")
         self._start_minimized = self.char_cfg.get("main_minimized", False)
-
-        if _TRAY_OK:
-            self.root.after(500, self._init_tray_icon)
 
     # ── Name-to-ID disk cache ────────────────────────────────────────
     # Charge le cache nom→type_id depuis le disque
@@ -2818,64 +2814,6 @@ class CharacterWindow:
         else:
             label.config(text=f"\u25C8 CALC{dots}{pad}", fg=CK)
 
-    # Initialise l'icône de la barre des tâches système
-    def _init_tray_icon(self):
-        try:
-            icon_img = None
-
-            # Check for icon files
-            for fname in ('PVE.ico', 'PVE.png'):
-                icon_path = _get_resource_path(fname)
-                if os.path.exists(icon_path):
-                    icon_img = Image.open(icon_path)
-                    break
-            
-            if icon_img is None:
-
-                # Create a visible fallback icon (cyan circle on dark grey)
-                icon_img = Image.new('RGB', (64, 64), "#1a1a1a")
-                d = ImageDraw.Draw(icon_img)
-                d.ellipse([10, 10, 54, 54], outline="#3dd8e0", width=6)
-                d.point([32, 32], fill="#ffffff")
-
-            def tray_loop():
-                try:
-                    self._tray_icon.run()
-                except Exception as e:
-                    traceback.print_exc()
-
-            menu = pystray.Menu(
-                pystray.MenuItem("Show Dashboard", self._tray_show, default=True),
-                pystray.MenuItem("Exit", self._tray_exit)
-            )
-            
-            self._tray_icon = pystray.Icon("PVE", icon_img, "EVE PVE Dashboard", menu)
-            
-            self._tray_thread = threading.Thread(target=tray_loop, daemon=True)
-            self._tray_thread.start()
-            
-        except Exception as e:
-            traceback.print_exc()
-
-    # Callback pystray — affiche la fenêtre principale depuis le tray
-    def _tray_show(self, icon=None, item=None):
-        self.root.after(0, self._restore_window)
-
-    # Restaure et met au premier plan la fenêtre principale
-    def _restore_window(self):
-
-        # Restore and bring window to front
-        self._main_hidden = False
-        self.root.deiconify()
-        self.root.lift()
-        self.root.attributes("-topmost", True)
-
-    # Callback pystray — quitte l'application depuis le tray
-    def _tray_exit(self, icon=None, item=None):
-        if self._tray_icon:
-            self._tray_icon.stop()
-        self.root.after(0, self._quit)
-
     # Sauvegarde la session, la config et ferme l'application
     def _quit(self):
         d = self.data
@@ -2917,10 +2855,6 @@ class CharacterWindow:
         if self.fh:
             self.fh.close()
         self._close_chatlog()
-        if self._tray_icon:
-            try: self._tray_icon.stop()
-            except Exception:
-                pass
         self.root.destroy()   # destroys this Toplevel; MainUI root stays alive
 
     # ── Parse a combat log line ──────────────────────────────────────
@@ -3234,23 +3168,6 @@ class CharacterWindow:
             self._hw.w.lift()
             return
         self._hw = HistoryWindow(self.root, self, char_name=self.char_name)
-
-    # Masque la fenêtre principale et garde les panels détachés visibles
-    def _minimize_to_tray(self):
-
-        # Hide window — tray icon stays running
-        self._main_hidden = True
-        self.root.withdraw()
-
-        # Keep detached panels visible
-        for win_attr in ("_isk_window", "_dps_window", "_msn_window", "_anom_window", "_alert_window"):
-            try:
-                win = getattr(self, win_attr)
-                if win and win.w.winfo_exists():
-                    win.w.deiconify()
-                    win.w.lift()
-            except Exception:
-                pass
 
     # Relit le log courant pour récupérer les bounties récentes et initialiser le compteur de session
     def _backfill_bounties(self):
@@ -4012,12 +3929,16 @@ class MainUI:
         self._is_collapsed   = False
         self._full_height    = 0
         self._dragging       = False
+        self._tray_icon      = None
 
         self._build()
         self._restore_geometry()
         self._scan()
         self._health_check()
         self._auto_scan()
+
+        if _TRAY_OK:
+            self.root.after(500, self._init_tray_icon)
 
         self.root.deiconify()
         self.root.mainloop()
@@ -4449,6 +4370,62 @@ class MainUI:
         else:
             self.root.geometry(f"{self.MAIN_W}x300+10+80")
 
+    # ── System tray (single icon for the whole app) ──────────────────
+    def _init_tray_icon(self):
+        try:
+            icon_img = None
+            for fname in ('PVE.ico', 'PVE.png'):
+                icon_path = _get_resource_path(fname)
+                if os.path.exists(icon_path):
+                    icon_img = Image.open(icon_path)
+                    break
+            if icon_img is None:
+                icon_img = Image.new('RGB', (64, 64), "#1a1a1a")
+                d = ImageDraw.Draw(icon_img)
+                d.ellipse([10, 10, 54, 54], outline="#3dd8e0", width=6)
+                d.point([32, 32], fill="#ffffff")
+
+            menu = pystray.Menu(
+                pystray.MenuItem("Show Overview", self._tray_show, default=True),
+                pystray.MenuItem("Exit", self._tray_exit),
+            )
+            self._tray_icon = pystray.Icon("PVE", icon_img, "EVE Ratting", menu)
+            threading.Thread(target=self._tray_icon.run, daemon=True).start()
+        except Exception:
+            traceback.print_exc()
+
+    def _tray_show(self, icon=None, item=None):
+        self.root.after(0, self._tray_restore)
+
+    def _tray_restore(self):
+        self.root.deiconify()
+        self.root.lift()
+        self.root.attributes("-topmost", True)
+        for char_id, win in self._windows.items():
+            try:
+                if not win.root.winfo_exists():
+                    continue
+                show = self.cfg.get("chars", {}).get(char_id, {}).get("show", True)
+                if show:
+                    win.root.deiconify()
+                    win.root.lift()
+                    for attr in ("_isk_window", "_dps_window", "_msn_window",
+                                 "_anom_window", "_alert_window"):
+                        dw = getattr(win, attr, None)
+                        if dw and dw.w.winfo_exists():
+                            dw.w.deiconify()
+                            dw.w.lift()
+            except Exception:
+                pass
+
+    def _tray_exit(self, icon=None, item=None):
+        if self._tray_icon:
+            try:
+                self._tray_icon.stop()
+            except Exception:
+                pass
+        self.root.after(0, self._quit)
+
     # ── Quit all ─────────────────────────────────────────────────────
     def _quit(self):
         if self._health_job:
@@ -4458,6 +4435,11 @@ class MainUI:
             self.root.after_cancel(self._scan_job)
             self._scan_job = None
         self._save_pos()
+        if self._tray_icon:
+            try:
+                self._tray_icon.stop()
+            except Exception:
+                pass
         for win in list(self._windows.values()):
             try:
                 win._quit()
