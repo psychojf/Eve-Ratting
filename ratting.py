@@ -3895,13 +3895,188 @@ class MainUISettings:
         save_config(cfg)
 
 
+# ── Fleet manager popup (add / remove characters from active fleet) ───
+class FleetManager:
+
+    def __init__(self, parent_root, main_ui):
+        self.main_ui = main_ui
+        self._dx = self._dy = 0
+
+        self.w = tk.Toplevel(parent_root)
+        self.w.overrideredirect(True)
+        self.w.configure(bg=BG, highlightbackground=BDG,
+                         highlightcolor=BDG, highlightthickness=1)
+        self.w.attributes("-topmost", True)
+        self.w.attributes("-alpha", main_ui.cfg.get("alpha", DEF_ALPHA))
+
+        saved = main_ui.cfg.get("main_ui", {}).get("fleet_mgr_pos", "")
+        if saved:
+            self.w.geometry(f"300x400{saved}")
+        else:
+            self.w.geometry(
+                f"300x400+{parent_root.winfo_x()+40}+{parent_root.winfo_y()+44}")
+
+        F8B  = tkfont.Font(family="Consolas", size=8,  weight="bold")
+        F10B = tkfont.Font(family="Consolas", size=10, weight="bold")
+        F12B = tkfont.Font(family="Consolas", size=12, weight="bold")
+
+        hdr = tk.Frame(self.w, bg=BG_H, height=32)
+        hdr.pack(fill="x")
+        hdr.pack_propagate(False)
+        hdr.bind("<Button-1>",
+                 lambda e: (setattr(self, "_dx", e.x), setattr(self, "_dy", e.y)))
+        hdr.bind("<B1-Motion>",
+                 lambda e: self.w.geometry(
+                     f"+{self.w.winfo_x()+e.x-self._dx}"
+                     f"+{self.w.winfo_y()+e.y-self._dy}"))
+        hdr.bind("<ButtonRelease-1>", lambda e: self._save_pos())
+
+        tk.Frame(hdr, bg=CI, width=3).pack(side="left", fill="y")
+        tk.Label(hdr, text="  ◈ FLEET MANAGER",
+                 font=F10B, bg=BG_H, fg=T0).pack(side="left")
+        xb = tk.Label(hdr, text="✕", font=F12B,
+                      bg=BG_H, fg=TD, padx=8, cursor="hand2")
+        xb.pack(side="right", fill="y")
+        xb.bind("<Button-1>", lambda e: self.w.destroy())
+        xb.bind("<Enter>",    lambda e: xb.config(fg=CR))
+        xb.bind("<Leave>",    lambda e: xb.config(fg=TD))
+        tk.Frame(self.w, bg=BDG, height=1).pack(fill="x")
+
+        # Subtitle
+        tk.Label(self.w, text="Toggle characters in the active fleet.",
+                 font=tkfont.Font(family="Consolas", size=8),
+                 bg=BG, fg=TD).pack(anchor="w", padx=10, pady=(6, 0))
+
+        tk.Frame(self.w, bg=BD, height=1).pack(fill="x", padx=10, pady=(4, 0))
+
+        # Scrollable character list
+        canvas = tk.Canvas(self.w, bg=BG, highlightthickness=0)
+        canvas.pack(fill="both", expand=True, padx=0, pady=0)
+        self._list_frame = tk.Frame(canvas, bg=BG)
+        _win = canvas.create_window((0, 0), window=self._list_frame, anchor="nw")
+        def _fm_fix_sr(e, c=canvas):
+            bb = c.bbox("all")
+            if bb:
+                c.configure(scrollregion=(0, 0, bb[2], bb[3]))
+
+        def _fm_scroll(ev, c=canvas):
+            c.yview_scroll(int(-1 * (ev.delta / 120)), "units")
+            if c.yview()[0] <= 0:
+                c.yview_moveto(0)
+
+        self._list_frame.bind("<Configure>", _fm_fix_sr)
+        canvas.bind("<Configure>",
+            lambda e: canvas.itemconfig(_win, width=e.width))
+        canvas.bind("<Enter>", lambda e: canvas.bind_all("<MouseWheel>", _fm_scroll))
+        canvas.bind("<Leave>", lambda e: canvas.unbind_all("<MouseWheel>"))
+
+        tk.Frame(self.w, bg=BD, height=1).pack(fill="x", padx=10, pady=(0, 4))
+
+        # Refresh button at the bottom
+        bot = tk.Frame(self.w, bg=BG)
+        bot.pack(fill="x", padx=10, pady=(0, 8))
+        refresh_lbl = tk.Label(bot, text="⟳ REFRESH",
+                               font=F8B, bg=BG, fg=TD, cursor="hand2")
+        refresh_lbl.pack(side="left")
+        refresh_lbl.bind("<Button-1>", lambda e: self._populate())
+        refresh_lbl.bind("<Enter>",    lambda e: refresh_lbl.config(fg=T0))
+        refresh_lbl.bind("<Leave>",    lambda e: refresh_lbl.config(fg=TD))
+
+        self._F8B = F8B
+        self._F9  = tkfont.Font(family="Consolas", size=9)
+        self._populate()
+
+    def _populate(self):
+        for w in self._list_frame.winfo_children():
+            w.destroy()
+
+        mu       = self.main_ui
+        cfg      = mu.cfg
+        char_map = cfg.setdefault("chars", {})
+        log_path = cfg.get("log_path", DEF_PATH)
+
+        # Scan logs fresh to get all known characters (including ignored ones)
+        cf = scan_logs(log_path)
+        if not cf:
+            tk.Label(self._list_frame, text="No characters found in logs.",
+                     font=self._F9, bg=BG, fg=TD).pack(padx=10, pady=6)
+            return
+
+        # Merge: chars from logs + chars already in windows (in case log file gone)
+        all_chars = {}
+        for char_id, log_file in cf.items():
+            name = rlisten(log_file) or f"Unknown ({char_id})"
+            all_chars[char_id] = name
+        for char_id, win in mu._windows.items():
+            if char_id not in all_chars:
+                all_chars[char_id] = win.char_name
+
+        for char_id, char_name in sorted(all_chars.items(), key=lambda x: x[1].lower()):
+            ignored = char_map.get(char_id, {}).get("ignored", False)
+            active  = char_id in mu._windows and not ignored
+
+            row = tk.Frame(self._list_frame, bg=BG)
+            row.pack(fill="x", padx=8, pady=2)
+
+            name_fg = T0 if active else TD
+            tk.Label(row, text=f"★ {char_name[:22]}",
+                     font=self._F9, bg=BG, fg=name_fg, anchor="w",
+                     width=22).pack(side="left")
+
+            btn_text = "✔ ACTIVE" if active else "✗ IGNORE"
+            btn_fg   = CI if active else CR
+            btn = tk.Label(row, text=btn_text, font=self._F8B,
+                           bg=BG, fg=btn_fg, cursor="hand2", anchor="e")
+            btn.pack(side="right")
+            btn.bind("<Button-1>",
+                     lambda e, cid=char_id, cn=char_name, lf=cf.get(char_id, ""):
+                         self._toggle(cid, cn, lf))
+            btn.bind("<Enter>", lambda e, b=btn: b.config(fg=T0))
+            btn.bind("<Leave>", lambda e, b=btn, a=active: b.config(fg=CI if a else CR))
+
+    def _toggle(self, char_id: str, char_name: str, log_file: str):
+        mu       = self.main_ui
+        cfg      = mu.cfg
+        char_map = cfg.setdefault("chars", {})
+        char_map.setdefault(char_id, {})
+
+        currently_active = char_id in mu._windows
+
+        if currently_active:
+            # Remove from fleet — close window and mark ignored
+            win = mu._windows.pop(char_id, None)
+            if win and win.root.winfo_exists():
+                win._quit()
+            char_map[char_id]["ignored"] = True
+        else:
+            # Add to fleet — clear ignored flag and spawn window
+            char_map[char_id]["ignored"] = False
+            if log_file and char_id not in mu._windows:
+                win = CharacterWindow(mu.root, mu, char_id, char_name, log_file, cfg)
+                mu._windows[char_id] = win
+                if char_map[char_id].get("show", True):
+                    win.root.deiconify()
+
+        save_config(cfg)
+        mu._rebuild_rows()
+        self._populate()   # refresh the list to reflect new state
+
+    def _save_pos(self):
+        try:
+            self.main_ui.cfg.setdefault("main_ui", {})["fleet_mgr_pos"] = (
+                f"+{self.w.winfo_x()}+{self.w.winfo_y()}")
+            save_config(self.main_ui.cfg)
+        except Exception:
+            pass
+
+
 # ── Fleet overview ────────────────────────────────────────────────────
 class MainUI:
 
     MAIN_W    = 360
     _COL_NAME  = 18   # character column width in chars (Consolas 8B)
     _COL_ISK   = 10   # "9.99B/hr" — raw bounty/hr
-    _COL_NET   = 10   # "9.99B/hr" — net after tax + loot
+    _COL_NET   = 10   # total session net (bounties after tax + loot)
     _COL_TIME  =  9   # "00:00:00"
 
     def __init__(self):
@@ -3921,6 +4096,8 @@ class MainUI:
         self._total_net_lbl   = None
         self._health_job      = None
         self._settings_win    = None
+        self._fleet_mgr_win   = None
+        self._label_vals: dict = {}   # id(label) → {text, fg} — Python-side cache for _lset
         self._dx = self._dy = 0
         self._rw = self._rh = self._rx = self._ry = self._wx = self._wy = 0
         self._last_clipboard  = ""  # shared across all CharacterWindows — first to see a paste wins
@@ -3947,15 +4124,103 @@ class MainUI:
     def _scan(self):
         cf = scan_logs(self.cfg.get("log_path", DEF_PATH))
         char_map = self.cfg.setdefault("chars", {})
+
+        # Collect truly new characters (never seen before — not in config at all)
+        new_chars = {}   # char_id → (char_name, log_file)
         for char_id, log_file in cf.items():
             if char_id in self._windows:
                 continue
-            char_name = rlisten(log_file) or f"Unknown ({char_id})"
-            win = CharacterWindow(self.root, self, char_id, char_name, log_file, self.cfg)
-            self._windows[char_id] = win
-            if char_map.get(char_id, {}).get("show", True):
-                win.root.deiconify()
+            if char_id in char_map:
+                # Already known — skip if ignored, otherwise spawn
+                if char_map[char_id].get("ignored", False):
+                    continue
+                char_name = rlisten(log_file) or f"Unknown ({char_id})"
+                win = CharacterWindow(self.root, self, char_id, char_name, log_file, self.cfg)
+                self._windows[char_id] = win
+                if char_map[char_id].get("show", True):
+                    win.root.deiconify()
+            else:
+                char_name = rlisten(log_file) or f"Unknown ({char_id})"
+                new_chars[char_id] = (char_name, log_file)
+
+        if new_chars:
+            selected = self._show_char_picker(new_chars)
+            for char_id, (char_name, log_file) in new_chars.items():
+                if char_id in selected:
+                    win = CharacterWindow(self.root, self, char_id, char_name, log_file, self.cfg)
+                    self._windows[char_id] = win
+                    if char_map.get(char_id, {}).get("show", True):
+                        win.root.deiconify()
+                else:
+                    char_map.setdefault(char_id, {})["ignored"] = True
+            save_config(self.cfg)
+
         self._rebuild_rows()
+
+    # ── Character picker popup — returns set of selected char_ids ────────
+    def _show_char_picker(self, new_chars: dict) -> set:
+        """Modal dialog — user picks which new characters to add to the fleet."""
+        dlg = tk.Toplevel(self.root)
+        dlg.title("Add Characters to Fleet")
+        dlg.configure(bg=BG)
+        dlg.resizable(False, False)
+        dlg.attributes("-topmost", True)
+        dlg.grab_set()   # modal
+
+        F8B = tkfont.Font(family="Consolas", size=8, weight="bold")
+        F9  = tkfont.Font(family="Consolas", size=9)
+
+        tk.Label(dlg, text="NEW CHARACTERS DETECTED",
+                 font=F8B, bg=BG, fg=TD, pady=6).pack(fill="x", padx=10)
+        tk.Label(dlg, text="Select which characters to add to the ratting fleet:",
+                 font=F9, bg=BG, fg=T0).pack(padx=10, anchor="w")
+
+        tk.Frame(dlg, bg=BD, height=1).pack(fill="x", padx=10, pady=(4, 0))
+
+        frame = tk.Frame(dlg, bg=BG)
+        frame.pack(fill="x", padx=10, pady=4)
+
+        vars_ = {}
+        for char_id, (char_name, _) in sorted(new_chars.items(), key=lambda x: x[1][0].lower()):
+            var = tk.BooleanVar(value=True)
+            vars_[char_id] = var
+            cb = tk.Checkbutton(frame, text=char_name, variable=var,
+                                 font=F9, bg=BG, fg=T0, selectcolor=BG,
+                                 activebackground=BG, activeforeground=CI,
+                                 anchor="w")
+            cb.pack(fill="x", pady=1)
+
+        tk.Frame(dlg, bg=BD, height=1).pack(fill="x", padx=10, pady=(0, 4))
+
+        btn_row = tk.Frame(dlg, bg=BG)
+        btn_row.pack(pady=(0, 8), padx=10)
+
+        def _select_all():
+            for v in vars_.values(): v.set(True)
+
+        def _select_none():
+            for v in vars_.values(): v.set(False)
+
+        def _confirm():
+            dlg.destroy()
+
+        tk.Button(btn_row, text="All",  font=F9, bg=BG_H, fg=T0, relief="flat",
+                  command=_select_all,  padx=6, pady=2).pack(side="left", padx=(0, 4))
+        tk.Button(btn_row, text="None", font=F9, bg=BG_H, fg=T0, relief="flat",
+                  command=_select_none, padx=6, pady=2).pack(side="left", padx=(0, 12))
+        tk.Button(btn_row, text="Add Selected", font=F8B, bg=CI, fg=BG, relief="flat",
+                  command=_confirm, padx=8, pady=3).pack(side="left")
+
+        # Centre over the main window
+        self.root.update_idletasks()
+        rx = self.root.winfo_x() + self.root.winfo_width()  // 2
+        ry = self.root.winfo_y() + self.root.winfo_height() // 2
+        dlg.update_idletasks()
+        dlg.geometry(f"+{rx - dlg.winfo_width()//2}+{ry - dlg.winfo_height()//2}")
+
+        dlg.wait_window()   # blocks until _confirm() or window closed
+
+        return {cid for cid, v in vars_.items() if v.get()}
 
     # ── Auto-scan every 10 s so new characters appear without a button ──
     def _auto_scan(self):
@@ -4004,6 +4269,14 @@ class MainUI:
         gb.bind("<Leave>",    lambda e: gb.config(fg=TD))
         Tooltip(gb, "Settings")
 
+        fb = tk.Label(hdr, text="◈", font=F11B,
+                      bg=BG_H, fg=TD, padx=5, cursor="hand2")
+        fb.pack(side="right", fill="y")
+        fb.bind("<Button-1>", lambda e: self._fleet_manager())
+        fb.bind("<Enter>",    lambda e: fb.config(fg=CI))
+        fb.bind("<Leave>",    lambda e: fb.config(fg=TD))
+        Tooltip(fb, "Fleet Manager")
+
         tk.Frame(self.root, bg=BDG, height=1).pack(fill="x")
 
         # Resize grip — must be packed with side="bottom" BEFORE the expanding body
@@ -4043,7 +4316,7 @@ class MainUI:
                            font=F8B, bg=BG, fg=TD,
                            width=self._COL_ISK, anchor="e")
         _ch_isk.pack(side="left")
-        _ch_net = tk.Label(col_hdr, text="NET/HR",
+        _ch_net = tk.Label(col_hdr, text="TOTAL NET",
                            font=F8B, bg=BG, fg=TD,
                            width=self._COL_NET, anchor="e")
         _ch_net.pack(side="left")
@@ -4058,13 +4331,22 @@ class MainUI:
         self._canvas.pack(fill="both", expand=True)
         self._rows_frame = tk.Frame(self._canvas, bg=BG)
         _win = self._canvas.create_window((0, 0), window=self._rows_frame, anchor="nw")
-        self._rows_frame.bind("<Configure>",
-            lambda e: self._canvas.configure(scrollregion=self._canvas.bbox("all")))
+
+        def _fix_scrollregion(e, c=self._canvas):
+            bb = c.bbox("all")
+            if bb:
+                c.configure(scrollregion=(0, 0, bb[2], bb[3]))
+
+        def _scroll_clamped(ev, c=self._canvas):
+            c.yview_scroll(int(-1 * (ev.delta / 120)), "units")
+            if c.yview()[0] <= 0:
+                c.yview_moveto(0)
+
+        self._rows_frame.bind("<Configure>", _fix_scrollregion)
         self._canvas.bind("<Configure>",
             lambda e: self._canvas.itemconfig(_win, width=e.width))
-        self._canvas.bind("<Enter>", lambda e: self._canvas.bind_all(
-            "<MouseWheel>",
-            lambda ev: self._canvas.yview_scroll(int(-1*(ev.delta/120)), "units")))
+        self._canvas.bind("<Enter>",
+            lambda e: self._canvas.bind_all("<MouseWheel>", _scroll_clamped))
         self._canvas.bind("<Leave>", lambda e: self._canvas.unbind_all("<MouseWheel>"))
 
         tk.Frame(body, bg=BD, height=1).pack(fill="x", pady=(3, 0))
@@ -4090,6 +4372,7 @@ class MainUI:
         for w in self._rows_frame.winfo_children():
             w.destroy()
         self._rows.clear()
+        self._label_vals.clear()   # stale label ids gone after widget destroy
 
         F8B = tkfont.Font(family="Consolas", size=8, weight="bold")
         F9  = tkfont.Font(family="Consolas", size=9)
@@ -4145,6 +4428,24 @@ class MainUI:
             self._apply_col_widths(*self._col_widths_for(self._main_last_w))
 
     # ── Live stats update + frozen detection ─────────────────────────
+    def _lset(self, lbl, text=None, fg=None):
+        """Update a label only when its value changed.
+
+        Compares against a Python-side cache (self._label_vals) instead of
+        calling lbl.cget(), which on Windows returns 12-digit hex colors that
+        never compare equal to the 6-digit hex strings we pass in.
+        """
+        lid  = id(lbl)
+        prev = self._label_vals.get(lid, {})
+        opts = {}
+        if text is not None and prev.get("text") != text:
+            opts["text"] = text
+        if fg is not None and prev.get("fg") != fg:
+            opts["fg"] = fg
+        if opts:
+            self._label_vals[lid] = {**prev, **opts}
+            lbl.config(**opts)
+
     def _health_check(self):
         now = time.monotonic()
         total_bnt = 0.0
@@ -4160,10 +4461,10 @@ class MainUI:
 
             frozen = (now - getattr(win, "_last_tick_wall", now)) > 1.5
             if frozen:
-                row["name"].config(fg=CW)
-                row["isk"].config( text="— NO TICK —", fg=CW)
-                row["net"].config( text="—",            fg=CW)
-                row["time"].config(text="—",            fg=CW)
+                self._lset(row["name"], fg=CW)
+                self._lset(row["isk"],  text="— NO TICK —", fg=CW)
+                self._lset(row["net"],  text="—",            fg=CW)
+                self._lset(row["time"], text="—",            fg=CW)
                 continue
 
             d   = win.data
@@ -4171,32 +4472,34 @@ class MainUI:
             sec = d.secs()
 
             if st == "running" and sec >= 60 and d.bg > 0:
-                bnt_hr = d.bg / sec * 3600
-                net_hr = d.isk()
+                bnt_hr  = d.bg / sec * 3600
+                net_tot = d.bg * (1 - d.tax) + d.loot_val   # cumulative session net
                 total_bnt += bnt_hr
-                total_net += net_hr
+                total_net += net_tot
                 running_n += 1
-                row["name"].config(fg=T0)
-                row["isk"].config( text=fisk(bnt_hr) + "/hr", fg=CI)
-                row["net"].config( text=fisk(net_hr) + "/hr",  fg=CG)
-                row["time"].config(text=fdur(sec),             fg=TD)
+                self._lset(row["name"], fg=T0)
+                self._lset(row["isk"],  text=fisk(bnt_hr)  + "/hr", fg=CI)
+                self._lset(row["net"],  text=fisk(net_tot),          fg=CG)
+                self._lset(row["time"], text=fdur(sec),               fg=TD)
             elif st == "paused":
-                row["name"].config(fg=CP)
-                row["isk"].config( text="— PAUSED —", fg=CP)
-                row["net"].config( text="—",           fg=CP)
-                row["time"].config(text=fdur(sec),     fg=TD)
+                d_p     = win.data
+                net_tot = d_p.bg * (1 - d_p.tax) + d_p.loot_val
+                self._lset(row["name"], fg=CP)
+                self._lset(row["isk"],  text="— PAUSED —",          fg=CP)
+                self._lset(row["net"],  text=fisk(net_tot) if net_tot > 0 else "—", fg=CP)
+                self._lset(row["time"], text=fdur(sec),              fg=TD)
             else:
-                row["name"].config(fg=T0)
-                row["isk"].config( text="— STANDBY —", fg=TD)
-                row["net"].config( text="—",            fg=TD)
-                row["time"].config(text="00:00:00",     fg=TD)
+                self._lset(row["name"], fg=T0)
+                self._lset(row["isk"],  text="— STANDBY —", fg=TD)
+                self._lset(row["net"],  text="—",            fg=TD)
+                self._lset(row["time"], text="00:00:00",     fg=TD)
 
         if running_n >= 2:
-            self._total_bnt_lbl.config(text=fisk(total_bnt) + "/hr", fg=CI)
-            self._total_net_lbl.config(text=fisk(total_net) + "/hr", fg=CG)
+            self._lset(self._total_bnt_lbl, text=fisk(total_bnt) + "/hr", fg=CI)
+            self._lset(self._total_net_lbl, text=fisk(total_net),          fg=CG)
         else:
-            self._total_bnt_lbl.config(text="")
-            self._total_net_lbl.config(text="")
+            self._lset(self._total_bnt_lbl, text="")
+            self._lset(self._total_net_lbl, text="")
 
         self._health_job = self.root.after(500, self._health_check)
 
@@ -4354,6 +4657,13 @@ class MainUI:
             self._settings_win.lift()
             return
         self._settings_win = MainUISettings(self.root, self).w
+
+    # ── Fleet Manager ─────────────────────────────────────────────────
+    def _fleet_manager(self):
+        if self._fleet_mgr_win and self._fleet_mgr_win.winfo_exists():
+            self._fleet_mgr_win.lift()
+            return
+        self._fleet_mgr_win = FleetManager(self.root, self).w
 
     # ── Geometry ─────────────────────────────────────────────────────
     def _save_pos(self):
