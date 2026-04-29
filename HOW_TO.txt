@@ -4,7 +4,8 @@
 
 A passive desktop dashboard for EVE Online PvE pilots. It reads
 the log files the EVE client writes to disk and turns them into a
-live overlay (DPS, ISK/h, bounties, missions, anomalies, EWAR).
+live overlay per character, plus a fleet overview window showing
+all active pilots at a glance.
 
 It does NOT touch the EVE client, network traffic or memory.
 
@@ -12,17 +13,19 @@ It does NOT touch the EVE client, network traffic or memory.
  1. WHAT YOU NEED
 ----------------------------------------------------------------
 
-  - Windows 10 or 11
+  - Windows 10/11  (or Linux — see section 10)
   - Python 3.9 or newer    (https://www.python.org/downloads/)
     -> During install, tick "Add Python to PATH"
   - The EVE Online client (gamelogs are enabled by default)
 
   Optional but recommended:
-  - pip install pystray Pillow pyperclip
-    (system tray icon + clipboard paste support)
+    pip install pystray Pillow pyperclip
 
   Or, from the project folder:
     pip install -r requirements.txt
+
+  Alternatively, run the pre-built "Eve Ratting.exe" directly —
+  no Python installation needed.
 
 ----------------------------------------------------------------
  2. MAKE SURE EVE IS LOGGING
@@ -32,10 +35,10 @@ It does NOT touch the EVE client, network traffic or memory.
     %USERPROFILE%\Documents\EVE\logs\Gamelogs
     %USERPROFILE%\Documents\EVE\logs\Chatlogs
 
-  Both folders should already exist after you have logged in to
-  the game at least once. If they are empty:
+  Both folders should already exist after logging in at least
+  once. If they are empty:
 
-  In the EVE client, open the Settings (ESC) menu and check that
+  In the EVE client, open ESC → Settings and confirm that
   "Log combat interactions to file" and chat logging are enabled.
 
 ----------------------------------------------------------------
@@ -48,132 +51,298 @@ It does NOT touch the EVE client, network traffic or memory.
 
   On first launch the app will:
     - create ratting_config.json next to the script
-    - try to find your EVE log directories
-    - start watching for the latest gamelog file
+    - auto-detect your EVE log directories
+    - scan for all characters with recent log files
+    - open the RATTING OVERVIEW window + one dashboard per char
 
-  Undock the EVE client window or move the dashboard to a second
-  monitor — it stays on top by default.
-
-----------------------------------------------------------------
- 4. THE DASHBOARD AT A GLANCE
-----------------------------------------------------------------
-
-  TIMER         Session length, with Play / Pause / Stop / Clear
-  DPS OUT/IN    Sliding 15-second window
-  HITS          Total hits dealt / received, plus misses
-  BOUNTIES      Gross bounties this session
-  TAX           Configurable bounty tax (default 12.5%)
-  LOOT          Estimated value of looted faction modules
-  NET ISK       Bounties - tax + loot
-  ISK/HOUR      Net ISK extrapolated to one hour
-  KILLS         NPC kill counter
-  MISSIONS      Current mission name + count + storyline progress
-  ANOMALIES     Current site time + completed sites + averages
-  ALERTS        Last few EWAR / escalation / dread spawn warnings
-  STANDINGS     Faction standing changes captured this session
-
-  Right-click most panels to detach them into their own
-  always-on-top window.
+  On subsequent launches, window positions and all settings are
+  restored automatically.
 
 ----------------------------------------------------------------
- 5. CONTROLS
+ 4. THE RATTING OVERVIEW (FLEET WINDOW)
 ----------------------------------------------------------------
 
-  PLAY      Start the session timer and begin parsing
-  PAUSE     Stop the timer without losing data
-  STOP      Save the session to history
-  CLEAR     Wipe the current session (asks first)
-  HISTORY   Open the past sessions browser
-  SETTINGS  Open the settings window
+  The RATTING OVERVIEW is the main hub. It lists every detected
+  character and shows their live metrics:
+
+    CHARACTER   Pilot name
+    BOUNTY/HR   Gross bounty income extrapolated to 1 hour
+    NET/HR      Net ISK/hour after tax and loot
+    SESSION     Elapsed session time
+
+  New characters are detected automatically every 10 seconds
+  whenever a new gamelog appears in the log folder.
+
+  Header buttons:
+    ⚙   Global Settings (paths, tax, opacity, theme)
+    ✕   Quit all windows
+
+  Double-click the title bar to collapse the overview to just
+  its header bar.
 
 ----------------------------------------------------------------
- 6. SETTINGS
+ 5. THE CHARACTER DASHBOARD
 ----------------------------------------------------------------
 
-  - Gamelog folder        path to EVE\logs\Gamelogs
-  - Chatlog folder        path to EVE\logs\Chatlogs
-  - Tax rate %            your corp / NPC bounty tax
-  - Theme                 22+ EVE / faction palettes
-  - Poll interval (ms)    how often to re-tail the log
-  - Start minimized       launch directly to the system tray
-  - Always on top         toggle the topmost flag
+  Each character gets its own always-on-top window. Sections
+  from top to bottom:
 
-  Settings are saved to ratting_config.json next to the script.
+  CONTROLS      Play / Pause / Stop / Reset / Next Site buttons
+  ALERTS        EWAR / escalation / loot feed (with CLR button)
+  ISK TRACKER   ISK/hour + session timer + breakdown
+  MISSIONS      Mission name, objective status, mission count,
+                storyline progress (or ANOMALY TRACKER — see §7)
+  DPS           Outgoing / incoming DPS (15-second window),
+                total damage dealt/received, hits and misses
+
+  Each section header has:
+    ON/OFF      Toggle the section on or off
+    ▼ / ▶      Collapse or expand the section content
+    ↱           Detach the section into its own floating window
+
+  Double-click the title bar to collapse the whole window
+  to just the header bar. Double-click again to restore.
+
+  Drag from the bottom-right corner grip to resize any window.
 
 ----------------------------------------------------------------
- 7. HISTORY
+ 6. CONTROLS
 ----------------------------------------------------------------
 
-  Each STOP saves a row to ratting_history.json:
-    date, character, duration, net ISK, ISK/h,
-    kills, sites cleared, missions done
+  ▶  PLAY       Start the session timer and begin parsing.
+                On Play, the last 15 minutes of the log are
+                back-filled so you don't miss recent bounties.
 
-  Open the History window to browse, sort and review past
-  sessions.
+  ⏸  PAUSE      Freeze the timer without losing any data.
+                Parsing continues so no events are missed.
+
+  ■  STOP       Save the current session to history and halt.
+
+  RESET         Save the session, then immediately start a fresh
+                new session (timer resets to zero).
+
+  NEXT SITE     Close the current anomaly site, save the session
+                data, and reset — convenient for back-to-back
+                sites without leaving the dashboard.
 
 ----------------------------------------------------------------
- 8. SYSTEM TRAY (OPTIONAL)
+ 7. ISK TRACKER
 ----------------------------------------------------------------
 
-  If pystray and Pillow are installed, closing the main window
-  minimizes Eve Ratting to the system tray. Right-click the tray
+  ISK / HOUR    Net ISK extrapolated to one hour
+  SESSION       Time elapsed since Play was pressed
+
+  The collapsible BREAKDOWN sub-section shows:
+    BOUNTIES    Gross bounty payouts
+    TAX         Tax withheld (configurable %)
+    LOOT        Clipboard-pasted loot value (see §9)
+    NET ISK     Bounties − tax + loot
+
+  Hover over the TAX value to see the exact ISK amount withheld.
+
+----------------------------------------------------------------
+ 8. MISSIONS TRACKER
+----------------------------------------------------------------
+
+  Reads the EVE chatlog to detect:
+    - Mission accepted (name from agent conversation log)
+    - Objective accomplished
+    - Mission completed (counter + storyline progress)
+    - Faction standing changes
+
+  STORYLINE progress counts toward the next storyline mission
+  (every 16 regular missions).
+
+  The MISSIONS section and the ANOMALY TRACKER (§9) are mutually
+  exclusive — only one can be active at a time.
+
+----------------------------------------------------------------
+ 9. ANOMALY TRACKER
+----------------------------------------------------------------
+
+  Automatically segments your ratting into discrete sites using
+  combat gaps. When no combat is detected for SITE GAP seconds
+  (default 45 s, configurable in Settings), the current site is
+  considered complete.
+
+  Displays:
+    CURRENT     Time spent in the active site
+    COMPLETED   Number of sites finished this session
+    AVG TIME    Average site completion time
+    AVG ISK     Average ISK per site
+    BEST ISK    Highest single-site ISK
+
+  Use NEXT SITE in the controls bar to force-close the current
+  site and immediately start the next one.
+
+  Note: enable ANOMALY TRACKER by toggling it ON in its section
+  header. This will automatically disable MISSIONS (they are
+  mutually exclusive).
+
+----------------------------------------------------------------
+ 10. LOOT ESTIMATION (CLIPBOARD)
+----------------------------------------------------------------
+
+  Requires pyperclip (pip install pyperclip).
+
+  While a session is running or paused:
+    1. In EVE, open your cargo / loot container.
+    2. Select All (Ctrl+A) → Copy (Ctrl+C).
+    3. Eve Ratting detects the clipboard automatically.
+
+  The LOOT label shows a spinner while pricing is in progress.
+  On completion it flashes green and adds an entry to the ALERTS
+  feed. The value is added to NET ISK and ISK/HOUR.
+
+  Pricing uses:
+    - Jita sell minimum for faction / deadspace modules (live ESI)
+    - Universe average price for all other items (24 h cached)
+    - Offline fallback table if ESI is unavailable
+
+----------------------------------------------------------------
+ 11. ALERTS FEED
+----------------------------------------------------------------
+
+  The ALERTS section shows up to 5 recent events:
+
+    SCRAM       Warp scramble attempt (NPC name)
+    WEB         Stasis web applied (NPC name)
+    ESCALATION  Escalation detected in the current site
+    DREAD       Dreadnought spawn notification
+    LOOT        Clipboard loot value added
+
+  The panel flashes briefly on new EWAR events.
+  Press CLR to clear all alerts.
+
+----------------------------------------------------------------
+ 12. DETACHED PANELS
+----------------------------------------------------------------
+
+  Click the ↱ button on any section header to pop it out into
+  its own always-on-top floating window. Each detached window:
+    - Remembers its position and size between sessions
+    - Is resizable via the bottom-right corner grip
+    - Can be re-attached by clicking ✕ in its title bar
+
+  Detached panels also scale their content when resized (the
+  ALERTS panel adjusts font size automatically).
+
+----------------------------------------------------------------
+ 13. SETTINGS
+----------------------------------------------------------------
+
+  Open Settings from the ⚙ button in the Overview header,
+  or from the character window header.
+
+  GAMELOGS PATH     Path to EVE\logs\Gamelogs
+  CHATLOGS PATH     Path to EVE\logs\Chatlogs
+  UPDATE INTERVAL   Log polling rate in milliseconds (default 250)
+  OPACITY %         Window transparency 20–100 % (default 85 %)
+  CORP TAX %        Bounty tax rate for net ISK calculation
+  SITE GAP (sec)    Seconds of no combat = end of anomaly site
+  THEME             22+ EVE / faction palettes
+
+  Themes are applied live — the window recolours in place with
+  no flicker. Theme is saved per character.
+
+  Settings are stored in ratting_config.json next to the script.
+
+----------------------------------------------------------------
+ 14. HISTORY
+----------------------------------------------------------------
+
+  Each STOP or RESET saves a row to ratting_history.json:
+    date, character, duration, gross ISK, net ISK, loot value,
+    ISK/h, kills, damage dealt/received, peak DPS in/out,
+    missions done, sites cleared, avg/best site time and ISK
+
+  Click the ☰ icon in a character window's title bar to open
+  the History popup for that character. It shows:
+    - Lifetime totals: sessions, total net ISK, kills, sites,
+      avg ISK/h
+    - A scrollable list of the last 100 sessions
+
+  Click CLEAR HISTORY at the bottom to wipe that character's
+  history (other characters are unaffected).
+
+----------------------------------------------------------------
+ 15. SYSTEM TRAY (OPTIONAL)
+----------------------------------------------------------------
+
+  If pystray and Pillow are installed, closing a character
+  window hides it rather than quitting. Right-click the tray
   icon for "Show Dashboard" / "Exit".
 
-  Without those packages the close button just exits.
+  Without those packages, the close button hides the window
+  back into the Overview list.
 
 ----------------------------------------------------------------
- 9. TROUBLESHOOTING
+ 16. TROUBLESHOOTING
 ----------------------------------------------------------------
 
-  "No log file found"
-    -> Check the Gamelog folder path in Settings.
-    -> Confirm the folder actually contains files like
-       20251231_180000_12345.txt
-    -> Make sure you have logged in to EVE at least once with the
-       current character.
+  "No character windows appear"
+    -> Make sure you have logged into EVE at least once with
+       the current character so a gamelog file exists.
+    -> Check the Gamelogs path in Settings.
+    -> Log files look like: 20251231_180000_12345678.txt
 
   "Bounties stay at zero"
-    -> EVE only writes bounty lines when an NPC dies AND you are
-       on the killmail. Pure logi/booster characters will not see
+    -> EVE only writes bounty lines when you are on the
+       killmail. Pure logi/booster characters will not see
        bounties.
 
   "Mission name not detected"
-    -> Eve Ratting reads chatlogs for "You have accepted the
-       mission ...". Make sure your chatlog folder is set and
-       that mission agent conversations are being logged.
+    -> Eve Ratting reads chatlogs for agent conversations.
+       Check the Chatlogs path in Settings and confirm that
+       "Agent_*.txt" files exist for your character.
 
-  Theme colors look wrong
-    -> Pick "EVE Online (Default)" in Settings to reset.
+  "Loot value is 0 after paste"
+    -> Confirm pyperclip is installed.
+    -> Copy the inventory with Ctrl+A then Ctrl+C inside EVE.
+    -> ESI may be temporarily down; the offline fallback table
+       will be used instead.
 
-  The window is hidden behind EVE
-    -> Toggle "Always on top" in Settings, or click the Eve
-       Ratting tray icon if you have pystray installed.
+  "Anomaly sites are not being split correctly"
+    -> Adjust SITE GAP in Settings. Increase it if a single
+       site is being split into multiple; decrease it if two
+       sites are being merged into one.
+
+  "Theme colours look wrong"
+    -> Select "EVE Online (Default)" in Settings to reset.
 
   Crash on startup
-    -> Run from a terminal (python ratting.py) so you can see
-       the traceback, then open a GitHub issue with it.
+    -> Run from a terminal (python ratting.py) to see the
+       traceback, then open a GitHub issue with it.
 
 ----------------------------------------------------------------
- 10. UNINSTALL
+ 17. LINUX
+----------------------------------------------------------------
+
+  The app auto-detects log paths for:
+    - Linux native EVE client
+      (~/.eve/sharedcache/tq/logs/)
+    - Linux Steam / Proton (default Steam library)
+    - Linux Steam with a custom library path
+
+  If auto-detection fails, set the path manually in Settings.
+
+----------------------------------------------------------------
+ 18. UNINSTALL
 ----------------------------------------------------------------
 
   Eve Ratting installs nothing system-wide. To remove it:
-
     1. Delete the project folder.
     2. (Optional) pip uninstall pystray Pillow pyperclip
 
   All settings, history and caches live next to ratting.py and
-  go away with the folder.
+  are removed with the folder.
 
 ----------------------------------------------------------------
- 11. SUPPORT
+ 19. SUPPORT
 ----------------------------------------------------------------
 
   Issues and feature requests:
     https://github.com/psychojf/Eve-Ratting/issues
-
-  Security disclosures:
-    See SECURITY.md
 
   Fly safe. o7
 ================================================================
