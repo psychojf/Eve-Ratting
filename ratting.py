@@ -297,11 +297,12 @@ def fisk(v):
 # Formate un montant ISK avec séparateurs d'espaces
 def fiskf(v): return f"{int(v):,}".replace(",", " ")
 
-# Formate des secondes en durée lisible (H:MM:SS)
+# Formate des secondes en durée lisible (HH:MM:SS)
 def fdur(s):
-    h, r = divmod(int(s), 3600)
+    s = max(0, int(s))
+    h, r = divmod(s, 3600)
     m, s2 = divmod(r, 60)
-    return f"{h}:{m:02d}:{s2:02d}" if h else f"{m:02d}:{s2:02d}"
+    return f"{h:02d}:{m:02d}:{s2:02d}"
 
 # Extrait l'arme et le type de coup depuis une chaîne de combat
 def ptail(t):
@@ -4073,11 +4074,11 @@ class FleetManager:
 # ── Fleet overview ────────────────────────────────────────────────────
 class MainUI:
 
-    MAIN_W    = 360
+    MAIN_W    = 360   # default & minimum window width — guarantees all columns visible
     _COL_NAME  = 18   # character column width in chars (Consolas 8B)
     _COL_ISK   = 10   # "9.99B/hr" — raw bounty/hr
     _COL_NET   = 10   # total session net (bounties after tax + loot)
-    _COL_TIME  =  9   # "00:00:00"
+    _COL_TIME  =  9   # "HH:MM:SS" — fixed, never scales down
 
     def __init__(self):
         self.root = tk.Tk()
@@ -4124,6 +4125,7 @@ class MainUI:
     def _scan(self):
         cf = scan_logs(self.cfg.get("log_path", DEF_PATH))
         char_map = self.cfg.setdefault("chars", {})
+        changed = False
 
         # Collect truly new characters (never seen before — not in config at all)
         new_chars = {}   # char_id → (char_name, log_file)
@@ -4139,6 +4141,7 @@ class MainUI:
                 self._windows[char_id] = win
                 if char_map[char_id].get("show", True):
                     win.root.deiconify()
+                changed = True
             else:
                 char_name = rlisten(log_file) or f"Unknown ({char_id})"
                 new_chars[char_id] = (char_name, log_file)
@@ -4151,11 +4154,13 @@ class MainUI:
                     self._windows[char_id] = win
                     if char_map.get(char_id, {}).get("show", True):
                         win.root.deiconify()
+                    changed = True
                 else:
                     char_map.setdefault(char_id, {})["ignored"] = True
             save_config(self.cfg)
 
-        self._rebuild_rows()
+        if changed:
+            self._rebuild_rows()
 
     # ── Character picker popup — returns set of selected char_ids ────────
     def _show_char_picker(self, new_chars: dict) -> set:
@@ -4424,8 +4429,8 @@ class MainUI:
             }
 
         self.root.update_idletasks()
-        if getattr(self, "_main_last_w", 0) > 0:
-            self._apply_col_widths(*self._col_widths_for(self._main_last_w))
+        w = getattr(self, "_main_last_w", 0) or self.root.winfo_width() or self.MAIN_W
+        self._apply_col_widths(*self._col_widths_for(w))
 
     # ── Live stats update + frozen detection ─────────────────────────
     def _lset(self, lbl, text=None, fg=None):
@@ -4489,10 +4494,11 @@ class MainUI:
                 self._lset(row["net"],  text=fisk(net_tot) if net_tot > 0 else "—", fg=CP)
                 self._lset(row["time"], text=fdur(sec),              fg=TD)
             else:
+                net_tot = d.bg * (1 - d.tax) + d.loot_val
                 self._lset(row["name"], fg=T0)
                 self._lset(row["isk"],  text="— STANDBY —", fg=TD)
-                self._lset(row["net"],  text="—",            fg=TD)
-                self._lset(row["time"], text="00:00:00",     fg=TD)
+                self._lset(row["net"],  text=fisk(net_tot) if net_tot > 0 else "—", fg=TD)
+                self._lset(row["time"], text=fdur(sec) if sec > 0 else "00:00:00",  fg=TD)
 
         if running_n >= 2:
             self._lset(self._total_bnt_lbl, text=fisk(total_bnt) + "/hr", fg=CI)
@@ -4570,7 +4576,7 @@ class MainUI:
         self._wy = self.root.winfo_y()
 
     def _resize_drag(self, e):
-        nw = max(280, self._rw + (e.x_root - self._rx))
+        nw = max(self.MAIN_W, self._rw + (e.x_root - self._rx))
         nh = max(100, self._rh + (e.y_root - self._ry))
         self.root.geometry(f"{nw}x{nh}+{self._wx}+{self._wy}")
 
@@ -4578,16 +4584,15 @@ class MainUI:
         self._save_pos()
 
     def _col_widths_for(self, w):
-        # w is the root window width; body has padx=6 each side (12px total).
-        # Button is packed first (side="right") so it always gets its space.
-        CHAR_PX  = 6
-        inner    = max(80, w - 24)   # body padx (12) + small border allowance (12)
-        scale    = max(0.85, min(2.5, inner / 240))
-        isk_ch   = max(8,  int(10 * scale))
-        net_ch   = max(8,  int(10 * scale))
-        time_ch  = max(7,  int(9  * scale))
-        name_ch  = max(10, int(max(1, inner - (isk_ch + net_ch + time_ch) * CHAR_PX) / CHAR_PX))
-        return name_ch, isk_ch, net_ch, time_ch
+        # Scale name/isk/net proportionally to window width.
+        # TIME is always fixed at 9 chars ("HH:MM:SS" = 8 chars, 1 padding).
+        # No pixel arithmetic — just ratio scaling off the 360 px baseline.
+        TIME_CH = 9
+        ratio   = max(0.75, min(2.5, w / self.MAIN_W))
+        isk_ch  = max(8,  round(10 * ratio))
+        net_ch  = max(8,  round(10 * ratio))
+        name_ch = max(10, round(18 * ratio))
+        return name_ch, isk_ch, net_ch, TIME_CH
 
     def _on_main_resize(self, event):
         if event.widget is not self.root:
@@ -4605,12 +4610,14 @@ class MainUI:
             self._scaling_main = False
 
     def _apply_col_widths(self, name_ch, isk_ch, net_ch, time_ch):
+        # Header row
         hdrs = getattr(self, "_col_hdrs", {})
         if hdrs.get("name"):  hdrs["name"].config(width=name_ch)
         if hdrs.get("isk"):   hdrs["isk"].config(width=isk_ch)
         if hdrs.get("net"):   hdrs["net"].config(width=net_ch)
         if hdrs.get("time"):  hdrs["time"].config(width=time_ch)
 
+        # Fleet-total row
         for lbl in (getattr(self, "_total_name_lbl", None),):
             if lbl: lbl.config(width=name_ch)
         for lbl in (getattr(self, "_total_bnt_lbl", None),):
@@ -4618,11 +4625,12 @@ class MainUI:
         for lbl in (getattr(self, "_total_net_lbl", None),):
             if lbl: lbl.config(width=net_ch)
 
-        for row_data in getattr(self, "_rows", {}).values():
-            if row_data.get("name"):  row_data["name"].config(width=name_ch)
-            if row_data.get("isk"):   row_data["isk"].config(width=isk_ch)
-            if row_data.get("net"):   row_data["net"].config(width=net_ch)
-            if row_data.get("time"):  row_data["time"].config(width=time_ch)
+        # Data rows — this is the critical part that was missing
+        for row_lbls in self._rows.values():
+            row_lbls["name"].config(width=name_ch)
+            row_lbls["isk"].config(width=isk_ch)
+            row_lbls["net"].config(width=net_ch)
+            row_lbls["time"].config(width=time_ch)
 
     def _toggle_collapse(self, event=None):
         if getattr(self, "_dragging", False):
