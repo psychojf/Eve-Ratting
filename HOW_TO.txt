@@ -13,7 +13,7 @@ It does NOT touch the EVE client, network traffic or memory.
  1. WHAT YOU NEED
 ----------------------------------------------------------------
 
-  - Windows 10/11  (or Linux — see section 10)
+  - Windows 10/11  (or Linux — see section 11)
   - Python 3.9 or newer    (https://www.python.org/downloads/)
     -> During install, tick "Add Python to PATH"
   - The EVE Online client (gamelogs are enabled by default)
@@ -53,35 +53,91 @@ It does NOT touch the EVE client, network traffic or memory.
     - create ratting_config.json next to the script
     - auto-detect your EVE log directories
     - scan for all characters with recent log files
-    - open the RATTING OVERVIEW window + one dashboard per char
+    - show a CHARACTER SELECTION popup (see §4)
+    - open the RATTING OVERVIEW window
 
   On subsequent launches, window positions and all settings are
   restored automatically.
 
 ----------------------------------------------------------------
- 4. THE RATTING OVERVIEW (FLEET WINDOW)
+ 4. CHARACTER SELECTION (FIRST LAUNCH)
 ----------------------------------------------------------------
 
-  The RATTING OVERVIEW is the main hub. It lists every detected
-  character and shows their live metrics:
+  The first time a new character is detected in your logs, a
+  popup appears listing all newly-found characters.
 
-    CHARACTER   Pilot name
-    BOUNTY/HR   Gross bounty income extrapolated to 1 hour
-    NET/HR      Net ISK/hour after tax and loot
-    SESSION     Elapsed session time
+  Each character has a checkbox (all checked by default):
+    ✔  Character will be added to the active fleet
+    ☐  Character will be marked IGNORED (never shown again)
 
-  New characters are detected automatically every 10 seconds
-  whenever a new gamelog appears in the log folder.
+  Buttons:
+    All        Check every character
+    None       Uncheck every character
+    Add Selected   Confirm and open fleet windows
+
+  Ignored characters can be brought back at any time via the
+  Fleet Manager (◈ button in the Overview header).
+
+----------------------------------------------------------------
+ 5. THE RATTING OVERVIEW (FLEET WINDOW)
+----------------------------------------------------------------
+
+  The RATTING OVERVIEW is the main hub. It lists every active
+  character and shows their live metrics as a table:
+
+    CHARACTER   Pilot name, prefixed with ★
+    TOTAL NET   Cumulative ISK earned this session
+                (bounties after tax + loot value)
+    ISK/HR      Net ISK per hour (bounties + loot, annualised)
+    SESSION     Elapsed session time (HH:MM:SS)
+
+  Row colours:
+    Green ★     Character window is visible — data tracking ON
+    Orange ★    Character window is hidden  — data tracking OFF
+
+  Click anywhere on a row to TOGGLE that character's window
+  (show/hide). The ★ in the character name acts as the button.
+
+  When a character is hidden (orange):
+    - Log polling is suspended immediately
+    - No new bounties, loot or kills are recorded
+    - The row shows their frozen TOTAL NET and "— OFFLINE —"
+    - When shown again, polling resumes from where it left off
 
   Header buttons:
+    ◈   Fleet Manager (add/remove characters from the fleet)
     ⚙   Global Settings (paths, tax, opacity, theme)
     ✕   Quit all windows
 
   Double-click the title bar to collapse the overview to just
-  its header bar.
+  its header bar. Drag the bottom-right grip to resize.
+
+  FLEET TOTAL row (shown when 2+ chars are ratting):
+    Left value    Combined TOTAL NET across all active chars
+    Right value   Combined ISK/HR across all active chars
 
 ----------------------------------------------------------------
- 5. THE CHARACTER DASHBOARD
+ 6. FLEET MANAGER (◈)
+----------------------------------------------------------------
+
+  Opens from the ◈ button in the Overview header. Shows every
+  character found in your logs (including ignored ones).
+
+  Each row shows the character name and a toggle:
+    ✔ ACTIVE    Character is in the fleet and tracked
+    ✗ IGNORE    Character is excluded from the fleet entirely
+
+  Click the toggle to instantly add or remove a character:
+    Removing    Closes their dashboard window (saves session)
+    Adding      Re-spawns their dashboard window immediately
+
+  ⟳ REFRESH    Re-scans logs (use after logging in a new char)
+
+  The Fleet Manager window remembers its position between
+  sessions.
+
+----------------------------------------------------------------
+ 7. THE CHARACTER DASHBOARD
 ----------------------------------------------------------------
 
   Each character gets its own always-on-top window. Sections
@@ -91,7 +147,7 @@ It does NOT touch the EVE client, network traffic or memory.
   ALERTS        EWAR / escalation / loot feed (with CLR button)
   ISK TRACKER   ISK/hour + session timer + breakdown
   MISSIONS      Mission name, objective status, mission count,
-                storyline progress (or ANOMALY TRACKER — see §7)
+                storyline progress (or ANOMALY TRACKER — see §9)
   DPS           Outgoing / incoming DPS (15-second window),
                 total damage dealt/received, hits and misses
 
@@ -106,7 +162,7 @@ It does NOT touch the EVE client, network traffic or memory.
   Drag from the bottom-right corner grip to resize any window.
 
 ----------------------------------------------------------------
- 6. CONTROLS
+ 8. CONTROLS
 ----------------------------------------------------------------
 
   ▶  PLAY       Start the session timer and begin parsing.
@@ -126,7 +182,7 @@ It does NOT touch the EVE client, network traffic or memory.
                 sites without leaving the dashboard.
 
 ----------------------------------------------------------------
- 7. ISK TRACKER
+ 9. ISK TRACKER
 ----------------------------------------------------------------
 
   ISK / HOUR    Net ISK extrapolated to one hour
@@ -135,13 +191,13 @@ It does NOT touch the EVE client, network traffic or memory.
   The collapsible BREAKDOWN sub-section shows:
     BOUNTIES    Gross bounty payouts
     TAX         Tax withheld (configurable %)
-    LOOT        Clipboard-pasted loot value (see §9)
+    LOOT        Clipboard-pasted loot value (see §10)
     NET ISK     Bounties − tax + loot
 
   Hover over the TAX value to see the exact ISK amount withheld.
 
 ----------------------------------------------------------------
- 8. MISSIONS TRACKER
+ 10. MISSIONS TRACKER
 ----------------------------------------------------------------
 
   Reads the EVE chatlog to detect:
@@ -153,11 +209,11 @@ It does NOT touch the EVE client, network traffic or memory.
   STORYLINE progress counts toward the next storyline mission
   (every 16 regular missions).
 
-  The MISSIONS section and the ANOMALY TRACKER (§9) are mutually
+  The MISSIONS section and the ANOMALY TRACKER (§11) are mutually
   exclusive — only one can be active at a time.
 
 ----------------------------------------------------------------
- 9. ANOMALY TRACKER
+ 11. ANOMALY TRACKER
 ----------------------------------------------------------------
 
   Automatically segments your ratting into discrete sites using
@@ -180,7 +236,7 @@ It does NOT touch the EVE client, network traffic or memory.
   mutually exclusive).
 
 ----------------------------------------------------------------
- 10. LOOT ESTIMATION (CLIPBOARD)
+ 12. LOOT ESTIMATION (CLIPBOARD)
 ----------------------------------------------------------------
 
   Requires pyperclip (pip install pyperclip).
@@ -200,7 +256,7 @@ It does NOT touch the EVE client, network traffic or memory.
     - Offline fallback table if ESI is unavailable
 
 ----------------------------------------------------------------
- 11. ALERTS FEED
+ 13. ALERTS FEED
 ----------------------------------------------------------------
 
   The ALERTS section shows up to 5 recent events:
@@ -215,7 +271,7 @@ It does NOT touch the EVE client, network traffic or memory.
   Press CLR to clear all alerts.
 
 ----------------------------------------------------------------
- 12. DETACHED PANELS
+ 14. DETACHED PANELS
 ----------------------------------------------------------------
 
   Click the ↱ button on any section header to pop it out into
@@ -228,7 +284,7 @@ It does NOT touch the EVE client, network traffic or memory.
   ALERTS panel adjusts font size automatically).
 
 ----------------------------------------------------------------
- 13. SETTINGS
+ 15. SETTINGS
 ----------------------------------------------------------------
 
   Open Settings from the ⚙ button in the Overview header,
@@ -238,6 +294,8 @@ It does NOT touch the EVE client, network traffic or memory.
   CHATLOGS PATH     Path to EVE\logs\Chatlogs
   UPDATE INTERVAL   Log polling rate in milliseconds (default 250)
   OPACITY %         Window transparency 20–100 % (default 85 %)
+                    All open windows update live, including the
+                    Settings and Fleet Manager windows themselves.
   CORP TAX %        Bounty tax rate for net ISK calculation
   SITE GAP (sec)    Seconds of no combat = end of anomaly site
   THEME             22+ EVE / faction palettes
@@ -248,7 +306,7 @@ It does NOT touch the EVE client, network traffic or memory.
   Settings are stored in ratting_config.json next to the script.
 
 ----------------------------------------------------------------
- 14. HISTORY
+ 16. HISTORY
 ----------------------------------------------------------------
 
   Each STOP or RESET saves a row to ratting_history.json:
@@ -266,7 +324,7 @@ It does NOT touch the EVE client, network traffic or memory.
   history (other characters are unaffected).
 
 ----------------------------------------------------------------
- 15. SYSTEM TRAY (OPTIONAL)
+ 17. SYSTEM TRAY (OPTIONAL)
 ----------------------------------------------------------------
 
   If pystray and Pillow are installed, closing a character
@@ -277,7 +335,7 @@ It does NOT touch the EVE client, network traffic or memory.
   back into the Overview list.
 
 ----------------------------------------------------------------
- 16. TROUBLESHOOTING
+ 18. TROUBLESHOOTING
 ----------------------------------------------------------------
 
   "No character windows appear"
@@ -310,12 +368,17 @@ It does NOT touch the EVE client, network traffic or memory.
   "Theme colours look wrong"
     -> Select "EVE Online (Default)" in Settings to reset.
 
+  "A character I hid is still showing data updating"
+    -> Hiding a character (orange ★) immediately suspends
+       their log polling. If values still change briefly, it
+       is data that was already buffered before the suspend.
+
   Crash on startup
     -> Run from a terminal (python ratting.py) to see the
        traceback, then open a GitHub issue with it.
 
 ----------------------------------------------------------------
- 17. LINUX
+ 19. LINUX
 ----------------------------------------------------------------
 
   The app auto-detects log paths for:
@@ -327,7 +390,7 @@ It does NOT touch the EVE client, network traffic or memory.
   If auto-detection fails, set the path manually in Settings.
 
 ----------------------------------------------------------------
- 18. UNINSTALL
+ 20. UNINSTALL
 ----------------------------------------------------------------
 
   Eve Ratting installs nothing system-wide. To remove it:
@@ -338,7 +401,7 @@ It does NOT touch the EVE client, network traffic or memory.
   are removed with the folder.
 
 ----------------------------------------------------------------
- 19. SUPPORT
+ 21. SUPPORT
 ----------------------------------------------------------------
 
   Issues and feature requests:

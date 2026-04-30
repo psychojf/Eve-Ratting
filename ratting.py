@@ -2968,6 +2968,10 @@ class CharacterWindow:
     # Boucle de lecture des logs et chatlog (s'exécute toutes les poll_ms ms)
     def _poll(self):
         try:
+            if getattr(self, "_suspended", False):
+                # Character hidden by overview — skip log reading entirely
+                self._poll_job = self.root.after(self.poll_ms, self._poll)
+                return
             if self._st == "running":
                 self._read()
                 latest_chat = self._find_latest_chatlog()
@@ -3814,6 +3818,13 @@ class MainUISettings:
             alpha = v / 100
             cfg["alpha"] = alpha
             mu.root.attributes("-alpha", alpha)
+            # Apply to this Settings window itself
+            if self.w.winfo_exists():
+                self.w.attributes("-alpha", alpha)
+            # Apply to Fleet Manager if open
+            fm = mu._fleet_mgr_win
+            if fm and fm.winfo_exists():
+                fm.attributes("-alpha", alpha)
             for win in mu._windows.values():
                 win.alpha = alpha
                 if win.root.winfo_exists():
@@ -4074,11 +4085,11 @@ class FleetManager:
 # ── Fleet overview ────────────────────────────────────────────────────
 class MainUI:
 
-    MAIN_W    = 360   # default & minimum window width — guarantees all columns visible
-    _COL_NAME  = 18   # character column width in chars (Consolas 8B)
-    _COL_ISK   = 10   # "9.99B/hr" — raw bounty/hr
-    _COL_NET   = 10   # total session net (bounties after tax + loot)
-    _COL_TIME  =  9   # "HH:MM:SS" — fixed, never scales down
+    MAIN_W    = 420   # default & minimum window width
+    # Treeview column pixel widths (fixed columns; char column stretches)
+    _TV_NET  = 85    # TOTAL NET
+    _TV_HR   = 85    # ISK/HR
+    _TV_SES  = 68    # SESSION (HH:MM:SS)
 
     def __init__(self):
         self.root = tk.Tk()
@@ -4092,13 +4103,15 @@ class MainUI:
         self.root.attributes("-alpha", self.cfg.get("alpha", DEF_ALPHA))
 
         self._windows: dict = {}   # char_id → CharacterWindow
-        self._rows:    dict = {}   # char_id → {name, isk, net, time, btn}
+        self._rows:    dict = {}   # char_id → iid in _tree (iid == char_id)
+        self._tree            = None
         self._total_bnt_lbl   = None
         self._total_net_lbl   = None
         self._health_job      = None
         self._settings_win    = None
         self._fleet_mgr_win   = None
-        self._label_vals: dict = {}   # id(label) → {text, fg} — Python-side cache for _lset
+        self._label_vals: dict = {}   # id(label) → {text, fg} — for fleet-total labels
+        self._tv_cache:   dict = {}   # (iid, col) → last value set in tree
         self._dx = self._dy = 0
         self._rw = self._rh = self._rx = self._ry = self._wx = self._wy = 0
         self._last_clipboard  = ""  # shared across all CharacterWindows — first to see a paste wins
@@ -4309,128 +4322,144 @@ class MainUI:
         tk.Label(hdr2, text="ACTIVE RATTING FLEET",
                  font=F8B, bg=BG, fg=T0).pack(side="left")
 
-        tk.Frame(body, bg=BD, height=1).pack(fill="x", pady=(0, 1))
+        tk.Frame(body, bg=BD, height=1).pack(fill="x", pady=(0, 2))
 
-        col_hdr = tk.Frame(body, bg=BG)
-        col_hdr.pack(fill="x", pady=(0, 2))
-        _ch_name = tk.Label(col_hdr, text="CHARACTER",
-                            font=F8B, bg=BG, fg=TD,
-                            width=self._COL_NAME, anchor="w")
-        _ch_name.pack(side="left")
-        _ch_isk = tk.Label(col_hdr, text="BOUNTY/HR",
-                           font=F8B, bg=BG, fg=TD,
-                           width=self._COL_ISK, anchor="e")
-        _ch_isk.pack(side="left")
-        _ch_net = tk.Label(col_hdr, text="TOTAL NET",
-                           font=F8B, bg=BG, fg=TD,
-                           width=self._COL_NET, anchor="e")
-        _ch_net.pack(side="left")
-        _ch_time = tk.Label(col_hdr, text="SESSION",
-                            font=F8B, bg=BG, fg=TD,
-                            width=self._COL_TIME, anchor="e")
-        _ch_time.pack(side="left")
-        self._col_hdrs = {"name": _ch_name, "isk": _ch_isk, "net": _ch_net, "time": _ch_time}
+        # ── Style Treeview to match the dark EVE theme ────────────────
+        st = ttk.Style()
+        st.theme_use("clam")
+        # Remove only the outer border wrapper from the layout.
+        # Keeping Treeview.treearea (via Treeview.padding) preserves tag colour
+        # rendering; removing Treeview.border eliminates the white highlight ring.
+        st.layout("RatTV.Treeview", [
+            ("Treeview.padding", {
+                "sticky": "nswe",
+                "children": [("Treeview.treearea", {"sticky": "nswe"})],
+            })
+        ])
+        st.configure("RatTV.Treeview",
+            background=BG, foreground=T0, fieldbackground=BG,
+            font=("Consolas", 9), rowheight=22,
+            borderwidth=0, relief="flat",
+        )
+        st.configure("RatTV.Treeview.Heading",
+            background=BG_H, foreground=TD,
+            font=("Consolas", 8, "bold"),
+            borderwidth=0, relief="flat", padding=(4, 3),
+        )
+        st.map("RatTV.Treeview",
+            background=[("selected", BD)],
+            foreground=[("selected", TB)],
+        )
+        st.map("RatTV.Treeview.Heading",
+            background=[("active", BDG), ("!active", BG_H)],
+            foreground=[("active", T0),  ("!active", TD)],
+            relief=[("active", "flat"), ("!active", "flat")],
+        )
 
-        # Scrollable rows — mousewheel only, no scrollbar widget
-        self._canvas = tk.Canvas(body, bg=BG, highlightthickness=0)
-        self._canvas.pack(fill="both", expand=True)
-        self._rows_frame = tk.Frame(self._canvas, bg=BG)
-        _win = self._canvas.create_window((0, 0), window=self._rows_frame, anchor="nw")
+        # ── Treeview ──────────────────────────────────────────────────
+        self._tree = ttk.Treeview(
+            body, style="RatTV.Treeview",
+            columns=("char", "net", "isk_hr", "session"),
+            show="headings", selectmode="none", takefocus=False,
+        )
+        tv = self._tree
 
-        def _fix_scrollregion(e, c=self._canvas):
-            bb = c.bbox("all")
-            if bb:
-                c.configure(scrollregion=(0, 0, bb[2], bb[3]))
+        tv.heading("char",    text="CHARACTER", anchor="w", command=lambda: None)
+        tv.heading("net",     text="TOTAL NET",  anchor="w", command=lambda: None)
+        tv.heading("isk_hr",  text="ISK/HR",     anchor="w", command=lambda: None)
+        tv.heading("session", text="SESSION",    anchor="w", command=lambda: None)
 
-        def _scroll_clamped(ev, c=self._canvas):
-            c.yview_scroll(int(-1 * (ev.delta / 120)), "units")
-            if c.yview()[0] <= 0:
-                c.yview_moveto(0)
+        tv.column("char",    stretch=True,  minwidth=80,  width=140, anchor="w")
+        tv.column("net",     stretch=False, minwidth=self._TV_NET,  width=self._TV_NET,  anchor="e")
+        tv.column("isk_hr",  stretch=False, minwidth=self._TV_HR,   width=self._TV_HR,   anchor="e")
+        tv.column("session", stretch=False, minwidth=self._TV_SES,  width=self._TV_SES,  anchor="e")
 
-        self._rows_frame.bind("<Configure>", _fix_scrollregion)
-        self._canvas.bind("<Configure>",
-            lambda e: self._canvas.itemconfig(_win, width=e.width))
-        self._canvas.bind("<Enter>",
-            lambda e: self._canvas.bind_all("<MouseWheel>", _scroll_clamped))
-        self._canvas.bind("<Leave>", lambda e: self._canvas.unbind_all("<MouseWheel>"))
+        # Green ★ = window visible, orange ★ = window hidden
+        tv.tag_configure("vis", foreground=CI)
+        tv.tag_configure("hid", foreground=CW)
 
+        tv.pack(fill="both", expand=True)
+        tv.bind("<MouseWheel>",      lambda e: tv.yview_scroll(int(-1*(e.delta/120)), "units"))
+        tv.bind("<ButtonRelease-1>", self._on_row_click)
+        tv.bind("<Motion>",          self._on_row_motion)
+        tv.bind("<Leave>",           lambda e: tv.configure(cursor=""))
+
+        # ── Fleet total row ───────────────────────────────────────────
         tk.Frame(body, bg=BD, height=1).pack(fill="x", pady=(3, 0))
         total_row = tk.Frame(body, bg=BG)
         total_row.pack(fill="x", pady=(2, 0))
         self._total_name_lbl = tk.Label(total_row, text="FLEET TOTAL",
-                                         font=F8B, bg=BG, fg=TD,
-                                         width=self._COL_NAME, anchor="w")
-        self._total_name_lbl.pack(side="left")
+                                         font=F8B, bg=BG, fg=TD, anchor="w")
+        self._total_name_lbl.pack(side="left", padx=(2, 0))
         self._total_bnt_lbl = tk.Label(total_row, text="",
-                                        font=F8B, bg=BG, fg=CI,
-                                        width=self._COL_ISK, anchor="e")
+                                        font=F8B, bg=BG, fg=CG, anchor="e",
+                                        width=12)
         self._total_bnt_lbl.pack(side="left")
         self._total_net_lbl = tk.Label(total_row, text="",
-                                        font=F8B, bg=BG, fg=CG,
-                                        width=self._COL_NET, anchor="e")
+                                        font=F8B, bg=BG, fg=CI, anchor="e",
+                                        width=12)
         self._total_net_lbl.pack(side="left")
 
         self.root.bind("<Configure>", self._on_main_resize)
 
-    # ── Rebuild all character rows (called after scan or window close) ─
+    # ── Rebuild all character rows in the Treeview ───────────────────
     def _rebuild_rows(self):
-        for w in self._rows_frame.winfo_children():
-            w.destroy()
+        tv = self._tree
+        for iid in tv.get_children():
+            tv.delete(iid)
         self._rows.clear()
-        self._label_vals.clear()   # stale label ids gone after widget destroy
-
-        F8B = tkfont.Font(family="Consolas", size=8, weight="bold")
-        F9  = tkfont.Font(family="Consolas", size=9)
+        self._tv_cache.clear()
 
         for char_id, win in self._windows.items():
             if not win.root.winfo_exists():
                 continue
-            visible = win.root.winfo_viewable()
-            row = tk.Frame(self._rows_frame, bg=BG)
-            row.pack(fill="x", pady=1)
-
-            raw = win.char_name
-            name_text = f"★ {raw[:16]}" + ("…" if len(raw) > 16 else "")
-            # Pack button first so side="right" claims its space before left-side labels
-            btn_text = "◎ SHOW" if not visible else "◎ HIDE"
-            btn_fg   = CI if not visible else TD
-            btn = tk.Label(row, text=btn_text,
-                           font=F8B, bg=BG, fg=btn_fg, cursor="hand2", padx=4)
-            btn.pack(side="right")
-
-            name_lbl = tk.Label(row, text=name_text,
-                                 font=F8B, bg=BG, fg=T0,
-                                 width=self._COL_NAME, anchor="w")
-            name_lbl.pack(side="left")
-
-            isk_lbl = tk.Label(row, text="—",
-                                font=F9, bg=BG, fg=TD,
-                                width=self._COL_ISK, anchor="e")
-            isk_lbl.pack(side="left")
-
-            net_lbl = tk.Label(row, text="—",
-                                font=F9, bg=BG, fg=TD,
-                                width=self._COL_NET, anchor="e")
-            net_lbl.pack(side="left")
-
-            time_lbl = tk.Label(row, text="00:00:00",
-                                 font=F9, bg=BG, fg=TD,
-                                 width=self._COL_TIME, anchor="e")
-            time_lbl.pack(side="left")
-            btn.bind("<Button-1>", lambda e, cid=char_id: self._toggle_window(cid))
-            btn.bind("<Enter>",    lambda e, b=btn: b.config(fg=T0))
-            btn.bind("<Leave>",    lambda e, b=btn, cid=char_id: b.config(
-                fg=CI if not (w := self._windows.get(cid))
-                          or not w.root.winfo_viewable() else TD))
-
-            self._rows[char_id] = {
-                "name": name_lbl, "isk": isk_lbl,
-                "net": net_lbl, "time": time_lbl, "btn": btn,
-            }
+            visible  = win.root.winfo_viewable()
+            name_txt = f"★ {win.char_name[:18]}" + ("…" if len(win.char_name) > 18 else "")
+            tv.insert("", "end", iid=char_id,
+                      values=(name_txt, "—", "— STANDBY —", "00:00:00"),
+                      tags=("vis" if visible else "hid",))
+            self._rows[char_id] = char_id   # iid == char_id
 
         self.root.update_idletasks()
-        w = getattr(self, "_main_last_w", 0) or self.root.winfo_width() or self.MAIN_W
-        self._apply_col_widths(*self._col_widths_for(w))
+        self._resize_char_col()
+
+    # ── Treeview helpers ──────────────────────────────────────────────
+    def _tv_set(self, iid: str, col: str, value: str):
+        """Update a Treeview cell only when the value actually changed."""
+        key = (iid, col)
+        if self._tv_cache.get(key) == value:
+            return
+        self._tv_cache[key] = value
+        self._tree.set(iid, col, value)
+
+    def _tv_tag(self, iid: str, state: str, visible: bool):
+        """Tag the 4 data columns by visibility only (state is for future use)."""
+        tag = "vis" if visible else "hid"
+        key = (iid, "__tag__")
+        if self._tv_cache.get(key) == tag:
+            return
+        self._tv_cache[key] = tag
+        self._tree.item(iid, tags=(tag,))
+
+    def _on_row_click(self, event):
+        """Click on any cell in a row toggles that character's window."""
+        iid = self._tree.identify_row(event.y)
+        if iid and self._tree.identify_region(event.x, event.y) == "cell":
+            self._toggle_window(iid)
+
+    def _on_row_motion(self, event):
+        """Show hand cursor when hovering over a data row."""
+        region = self._tree.identify_region(event.x, event.y)
+        self._tree.configure(cursor="hand2" if region == "cell" else "")
+
+    def _resize_char_col(self):
+        """Make the CHARACTER column fill all space the Treeview gives it."""
+        if not self._tree:
+            return
+        tv_w  = self._tree.winfo_width() or self.MAIN_W
+        fixed = self._TV_NET + self._TV_HR + self._TV_SES
+        char_w = max(80, tv_w - fixed)
+        self._tree.column("char", width=char_w)
 
     # ── Live stats update + frozen detection ─────────────────────────
     def _lset(self, lbl, text=None, fg=None):
@@ -4452,57 +4481,66 @@ class MainUI:
             lbl.config(**opts)
 
     def _health_check(self):
-        now = time.monotonic()
-        total_bnt = 0.0
-        total_net = 0.0
+        now       = time.monotonic()
+        fleet_net = 0.0
+        fleet_hr  = 0.0
         running_n = 0
 
         for char_id, win in self._windows.items():
-            row = self._rows.get(char_id)
-            if not row:
+            if char_id not in self._rows:
                 continue
             if not win.root.winfo_exists():
-                continue   # window destroyed outside normal _quit() path
+                continue
+
+            suspended = getattr(win, "_suspended", False)
+            vis       = win.root.winfo_viewable()
+
+            # Hidden (suspended) characters: show what they already earned, nothing more
+            if suspended:
+                d       = win.data
+                net_tot = d.bg * (1 - d.tax) + d.loot_val
+                self._tv_tag(char_id, "standby", False)   # orange — offline
+                self._tv_set(char_id, "net",     fisk(net_tot) if net_tot > 0 else "—")
+                self._tv_set(char_id, "isk_hr",  "— OFFLINE —")
+                self._tv_set(char_id, "session", fdur(d.acc_sec) if d.acc_sec > 0 else "00:00:00")
+                continue
 
             frozen = (now - getattr(win, "_last_tick_wall", now)) > 1.5
             if frozen:
-                self._lset(row["name"], fg=CW)
-                self._lset(row["isk"],  text="— NO TICK —", fg=CW)
-                self._lset(row["net"],  text="—",            fg=CW)
-                self._lset(row["time"], text="—",            fg=CW)
+                self._tv_tag(char_id, "frozen", vis)
+                self._tv_set(char_id, "net",     "— NO TICK —")
+                self._tv_set(char_id, "isk_hr",  "—")
+                self._tv_set(char_id, "session", "—")
                 continue
 
-            d   = win.data
-            st  = win._st
-            sec = d.secs()
+            d      = win.data
+            st     = win._st
+            sec    = d.secs()
+            net_tot = d.bg * (1 - d.tax) + d.loot_val
+            isk_hr  = d.isk()
 
             if st == "running" and sec >= 60 and d.bg > 0:
-                bnt_hr  = d.bg / sec * 3600
-                net_tot = d.bg * (1 - d.tax) + d.loot_val   # cumulative session net
-                total_bnt += bnt_hr
-                total_net += net_tot
+                fleet_net += net_tot
+                fleet_hr  += isk_hr
                 running_n += 1
-                self._lset(row["name"], fg=T0)
-                self._lset(row["isk"],  text=fisk(bnt_hr)  + "/hr", fg=CI)
-                self._lset(row["net"],  text=fisk(net_tot),          fg=CG)
-                self._lset(row["time"], text=fdur(sec),               fg=TD)
+                self._tv_tag(char_id, "run", vis)
+                self._tv_set(char_id, "net",     fisk(net_tot))
+                self._tv_set(char_id, "isk_hr",  fisk(isk_hr) + "/hr")
+                self._tv_set(char_id, "session", fdur(sec))
             elif st == "paused":
-                d_p     = win.data
-                net_tot = d_p.bg * (1 - d_p.tax) + d_p.loot_val
-                self._lset(row["name"], fg=CP)
-                self._lset(row["isk"],  text="— PAUSED —",          fg=CP)
-                self._lset(row["net"],  text=fisk(net_tot) if net_tot > 0 else "—", fg=CP)
-                self._lset(row["time"], text=fdur(sec),              fg=TD)
+                self._tv_tag(char_id, "paused", vis)
+                self._tv_set(char_id, "net",     fisk(net_tot) if net_tot > 0 else "—")
+                self._tv_set(char_id, "isk_hr",  "— PAUSED —")
+                self._tv_set(char_id, "session", fdur(sec))
             else:
-                net_tot = d.bg * (1 - d.tax) + d.loot_val
-                self._lset(row["name"], fg=T0)
-                self._lset(row["isk"],  text="— STANDBY —", fg=TD)
-                self._lset(row["net"],  text=fisk(net_tot) if net_tot > 0 else "—", fg=TD)
-                self._lset(row["time"], text=fdur(sec) if sec > 0 else "00:00:00",  fg=TD)
+                self._tv_tag(char_id, "standby", vis)
+                self._tv_set(char_id, "net",     fisk(net_tot) if net_tot > 0 else "—")
+                self._tv_set(char_id, "isk_hr",  "— STANDBY —")
+                self._tv_set(char_id, "session", fdur(sec) if sec > 0 else "00:00:00")
 
         if running_n >= 2:
-            self._lset(self._total_bnt_lbl, text=fisk(total_bnt) + "/hr", fg=CI)
-            self._lset(self._total_net_lbl, text=fisk(total_net),          fg=CG)
+            self._lset(self._total_bnt_lbl, text=fisk(fleet_net),        fg=CG)
+            self._lset(self._total_net_lbl, text=fisk(fleet_hr) + "/hr", fg=CI)
         else:
             self._lset(self._total_bnt_lbl, text="")
             self._lset(self._total_net_lbl, text="")
@@ -4515,7 +4553,6 @@ class MainUI:
         if not win or not win.root.winfo_exists():
             return
         char_cfg = self.cfg.setdefault("chars", {}).setdefault(char_id, {})
-        row = self._rows.get(char_id)
 
         if win.root.winfo_viewable():
             # HIDE — withdraw main + all detached panels (keep widgets alive for _tick)
@@ -4535,8 +4572,10 @@ class MainUI:
             win._hidden_detached = was_detached
             win.root.withdraw()
             char_cfg["show"] = False
-            if row:
-                row["btn"].config(text="◎ SHOW", fg=CI)
+            win._suspended = True          # stop log reading for this character
+            if char_id in self._rows:
+                self._tv_cache.pop((char_id, "__tag__"), None)
+                self._tv_tag(char_id, "standby", False)
         else:
             # SHOW — restore main window and all panels that were visible before hide
             win.root.deiconify()
@@ -4555,16 +4594,25 @@ class MainUI:
                             pass
             win._hidden_detached = []
             char_cfg["show"] = True
-            if row:
-                row["btn"].config(text="◎ HIDE", fg=TD)
-
+            win._suspended = False         # resume log reading
+            if char_id in self._rows:
+                self._tv_cache.pop((char_id, "__tag__"), None)
+                self._tv_tag(char_id, "standby", True)
+        
         save_config(self.cfg)
 
     # ── Called by CharacterWindow._quit() when a window closes itself ─
     def _on_char_closed(self, char_id: str):
         self._windows.pop(char_id, None)
-        if self.root.winfo_exists():
-            self._rebuild_rows()
+        self._rows.pop(char_id, None)
+        if self.root.winfo_exists() and self._tree:
+            try:
+                self._tree.delete(char_id)
+            except Exception:
+                pass
+            # purge cache entries for this char
+            for k in [k for k in self._tv_cache if k[0] == char_id]:
+                del self._tv_cache[k]
 
     # ── Resize grip ──────────────────────────────────────────────────
     def _resize_start(self, e):
@@ -4583,54 +4631,14 @@ class MainUI:
     def _resize_end(self, e):
         self._save_pos()
 
-    def _col_widths_for(self, w):
-        # Scale name/isk/net proportionally to window width.
-        # TIME is always fixed at 9 chars ("HH:MM:SS" = 8 chars, 1 padding).
-        # No pixel arithmetic — just ratio scaling off the 360 px baseline.
-        TIME_CH = 9
-        ratio   = max(0.75, min(2.5, w / self.MAIN_W))
-        isk_ch  = max(8,  round(10 * ratio))
-        net_ch  = max(8,  round(10 * ratio))
-        name_ch = max(10, round(18 * ratio))
-        return name_ch, isk_ch, net_ch, TIME_CH
-
     def _on_main_resize(self, event):
         if event.widget is not self.root:
-            return  # child widget Configure events propagate up; ignore them
-        if getattr(self, "_scaling_main", False):
             return
         w = event.width
         if abs(w - getattr(self, "_main_last_w", 0)) < 3:
             return
         self._main_last_w = w
-        self._scaling_main = True
-        try:
-            self._apply_col_widths(*self._col_widths_for(w))
-        finally:
-            self._scaling_main = False
-
-    def _apply_col_widths(self, name_ch, isk_ch, net_ch, time_ch):
-        # Header row
-        hdrs = getattr(self, "_col_hdrs", {})
-        if hdrs.get("name"):  hdrs["name"].config(width=name_ch)
-        if hdrs.get("isk"):   hdrs["isk"].config(width=isk_ch)
-        if hdrs.get("net"):   hdrs["net"].config(width=net_ch)
-        if hdrs.get("time"):  hdrs["time"].config(width=time_ch)
-
-        # Fleet-total row
-        for lbl in (getattr(self, "_total_name_lbl", None),):
-            if lbl: lbl.config(width=name_ch)
-        for lbl in (getattr(self, "_total_bnt_lbl", None),):
-            if lbl: lbl.config(width=isk_ch)
-        for lbl in (getattr(self, "_total_net_lbl", None),):
-            if lbl: lbl.config(width=net_ch)
-
-        # Data rows — this is the critical part that was missing
-        for row_lbls in self._rows.values():
-            row_lbls["name"].config(width=name_ch)
-            row_lbls["isk"].config(width=isk_ch)
-            row_lbls["net"].config(width=net_ch)
-            row_lbls["time"].config(width=time_ch)
+        self._resize_char_col()
 
     def _toggle_collapse(self, event=None):
         if getattr(self, "_dragging", False):
