@@ -1220,6 +1220,24 @@ class CharacterWindow:
 
         self.root.config(highlightbackground=BDG, highlightcolor=BDG, highlightthickness=1)
         self._fit()
+
+        # Restore collapsed state if window was closed while collapsed.
+        # winfo_* returns garbage while withdrawn — parse the geometry string instead.
+        full_h = self.char_cfg.get("main_full_height", 0)
+        if self.char_cfg.get("main_collapsed", False) and full_h > 32:
+            self._full_height = full_h
+            self._main_frame.pack_forget()
+            if hasattr(self, "_grip_bar"):
+                self._grip_bar.pack_forget()
+            self._hdr_b_go.pack(side="left", fill="y")
+            self._hdr_b_pa.pack(side="left", fill="y")
+            self._hdr_b_st.pack(side="left", fill="y")
+            saved = self.char_cfg.get("geometry", "")
+            m = re.match(r"(\d+)x\d+([+-]\d+[+-]\d+)", saved)
+            if m:
+                self.root.geometry(f"{m.group(1)}x32{m.group(2)}")
+            self._is_collapsed = True
+
         self._poll()
         self._tick()
 
@@ -1569,6 +1587,8 @@ class CharacterWindow:
                 x, y = self.root.winfo_x(), self.root.winfo_y()
                 self.root.geometry(f"{w}x{self._full_height}+{x}+{y}")
             self._is_collapsed = False
+            self.char_cfg["main_collapsed"] = False
+            save_config(self.cfg)
         else:
             # Collapse — hide content, show mini controls in title bar
             self._full_height = self.root.winfo_height()
@@ -1583,11 +1603,18 @@ class CharacterWindow:
             x, y = self.root.winfo_x(), self.root.winfo_y()
             self.root.geometry(f"{w}x32+{x}+{y}")
             self._is_collapsed = True
+            self.char_cfg["main_collapsed"] = True
+            self.char_cfg["main_full_height"] = self._full_height
+            save_config(self.cfg)
 
     # Sauvegarde la géométrie complète de la fenêtre principale
     def _save_pos(self):
         try:
             self.char_cfg["geometry"] = self.root.winfo_geometry()
+            if not self._is_collapsed:
+                h = self.root.winfo_height()
+                if h > 32:
+                    self.char_cfg["main_full_height"] = h
             save_config(self.cfg)
         except Exception:
             pass
@@ -3842,16 +3869,53 @@ class MainUISettings:
             self.bgm_var.set(not self.bgm_var.get())
             on = self.bgm_var.get()
             self._bgm_box.config(text="☑" if on else "☐", fg=CA if on else TD)
+            self._check_dirty()
         self._bgm_box.bind("<Button-1>", _toggle_bgm)
         bgm_lbl.bind("<Button-1>", _toggle_bgm)
 
-        ap = tk.Label(body, text="✔ APPLY",
-                      font=tkfont.Font(family="Consolas", size=10, weight="bold"),
-                      bg=BG_POP, fg=CA, cursor="hand2", padx=12)
-        ap.pack(side="right", pady=(6, 0))
-        ap.bind("<Button-1>", lambda e: self._apply())
-        ap.bind("<Enter>",    lambda e: ap.config(bg=BDG))
-        ap.bind("<Leave>",    lambda e: ap.config(bg=BG_POP))
+        # Snapshot of values at open time — used to detect changes
+        self._snap = {
+            "log":   self.pv.get(),
+            "chat":  self.cpv.get(),
+            "alpha": self.av.get(),
+            "tax":   self.tv.get(),
+            "theme": self._theme_var.get(),
+            "bgm":   self.bgm_var.get(),
+        }
+
+        ap_font = tkfont.Font(family="Consolas", size=10, weight="bold")
+        self._ap = tk.Label(body, text="✔ APPLY", font=ap_font,
+                            bg=BG_POP, fg=TD, padx=12)
+        self._ap.pack(side="right", pady=(6, 0))
+        self._ap_dirty = False
+
+        # Trace StringVars so any keystroke updates dirty state
+        for var in (self.pv, self.cpv, self.av, self.tv, self._theme_var):
+            var.trace_add("write", lambda *_: self._check_dirty())
+
+    def _check_dirty(self):
+        dirty = (
+            self.pv.get()          != self._snap["log"]   or
+            self.cpv.get()         != self._snap["chat"]  or
+            self.av.get()          != self._snap["alpha"] or
+            self.tv.get()          != self._snap["tax"]   or
+            self._theme_var.get()  != self._snap["theme"] or
+            self.bgm_var.get()     != self._snap["bgm"]
+        )
+        if dirty == self._ap_dirty:
+            return
+        self._ap_dirty = dirty
+        if dirty:
+            self._ap.config(fg=CA, cursor="hand2")
+            self._ap.bind("<Button-1>", lambda e: self._apply())
+            self._ap.bind("<Enter>",    lambda e: self._ap.config(bg=BDG))
+            self._ap.bind("<Leave>",    lambda e: self._ap.config(bg=BG_POP))
+        else:
+            self._ap.config(fg=TD, cursor="")
+            self._ap.unbind("<Button-1>")
+            self._ap.unbind("<Enter>")
+            self._ap.unbind("<Leave>")
+            self._ap.config(bg=BG_POP)
 
     def _save_pos(self):
         try:
@@ -3964,6 +4028,17 @@ class MainUISettings:
         cfg["bg_monitor"] = self.bgm_var.get()
 
         save_config(cfg)
+
+        # Reset snapshot so APPLY goes back to grayed-out
+        self._snap = {
+            "log":   self.pv.get(),
+            "chat":  self.cpv.get(),
+            "alpha": self.av.get(),
+            "tax":   self.tv.get(),
+            "theme": self._theme_var.get(),
+            "bgm":   self.bgm_var.get(),
+        }
+        self._check_dirty()
 
 
 # ── Fleet manager popup (add / remove characters from active fleet) ───
@@ -4183,6 +4258,17 @@ class MainUI:
 
         self._build()
         self._restore_geometry()
+
+        # Restore collapsed state if overview was closed while collapsed.
+        # _restore_geometry() already set the correct geometry (position + collapsed height).
+        # We must NOT call winfo_* here — the window is still withdrawn and returns garbage.
+        mui = self.cfg.get("main_ui", {})
+        full_h = mui.get("full_height", 0)
+        if mui.get("collapsed", False) and full_h > 32:
+            self._full_height = full_h
+            self._body.pack_forget()
+            self._is_collapsed = True
+
         self._scan()
         self._health_check()
         self._auto_scan()
@@ -4724,8 +4810,9 @@ class MainUI:
                 x, y = self.root.winfo_x(), self.root.winfo_y()
                 self.root.geometry(f"{w}x{self._full_height}+{x}+{y}")
             self._is_collapsed = False
-            # Force canvas and column widths to recalculate after re-pack
             self._main_last_w = 0
+            self.cfg.setdefault("main_ui", {})["collapsed"] = False
+            save_config(self.cfg)
         else:
             self._full_height = self.root.winfo_height()
             self._body.pack_forget()
@@ -4734,6 +4821,10 @@ class MainUI:
             x, y = self.root.winfo_x(), self.root.winfo_y()
             self.root.geometry(f"{w}x29+{x}+{y}")
             self._is_collapsed = True
+            mui = self.cfg.setdefault("main_ui", {})
+            mui["collapsed"] = True
+            mui["full_height"] = self._full_height
+            save_config(self.cfg)
 
     # ── Settings ─────────────────────────────────────────────────────
     def _settings(self):
@@ -4752,7 +4843,12 @@ class MainUI:
     # ── Geometry ─────────────────────────────────────────────────────
     def _save_pos(self):
         try:
-            self.cfg.setdefault("main_ui", {})["geometry"] = self.root.winfo_geometry()
+            mui = self.cfg.setdefault("main_ui", {})
+            mui["geometry"] = self.root.winfo_geometry()
+            if not self._is_collapsed:
+                h = self.root.winfo_height()
+                if h > 32:
+                    mui["full_height"] = h
             save_config(self.cfg)
         except Exception:
             pass
