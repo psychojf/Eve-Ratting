@@ -1194,10 +1194,11 @@ class CharacterWindow:
         self._dps_enabled  = self.cfg.get("dps_enabled", True)
 
         # Section collapsed states
-        self._isk_collapsed = self.cfg.get("isk_collapsed", False)
-        self._msn_collapsed = self.cfg.get("msn_collapsed", False)
-        self._anom_collapsed = self.cfg.get("anom_collapsed", False)
-        self._dps_collapsed = self.cfg.get("dps_collapsed", False)
+        self._isk_collapsed   = self.cfg.get("isk_collapsed",   False)
+        self._msn_collapsed   = self.cfg.get("msn_collapsed",   False)
+        self._anom_collapsed  = self.cfg.get("anom_collapsed",  False)
+        self._dps_collapsed   = self.cfg.get("dps_collapsed",   False)
+        self._alert_collapsed = self.cfg.get("alert_collapsed", False)
         self._brk_collapsed = self.cfg.get("brk_collapsed", False)
 
         self._current_theme = self.char_cfg.get("theme", THEME_DEFAULT)
@@ -1556,7 +1557,9 @@ class CharacterWindow:
             return
 
         if self._is_collapsed:
-            # Expand — restore content, then re-pack grip so it stays at the bottom
+            # Expand — restore content, hide mini controls, re-pack grip
+            for mb in (self._hdr_b_go, self._hdr_b_pa, self._hdr_b_st):
+                mb.pack_forget()
             self._main_frame.pack(fill="x", padx=3, pady=(0, 3))
             if hasattr(self, "_grip_bar"):
                 self._grip_bar.pack_forget()
@@ -1567,9 +1570,14 @@ class CharacterWindow:
                 self.root.geometry(f"{w}x{self._full_height}+{x}+{y}")
             self._is_collapsed = False
         else:
-            # Collapse — hide content, keep only header bar visible
+            # Collapse — hide content, show mini controls in title bar
             self._full_height = self.root.winfo_height()
             self._main_frame.pack_forget()
+            if hasattr(self, "_grip_bar"):
+                self._grip_bar.pack_forget()
+            self._hdr_b_go.pack(side="left", fill="y")
+            self._hdr_b_pa.pack(side="left", fill="y")
+            self._hdr_b_st.pack(side="left", fill="y")
             self.root.update_idletasks()
             w = self.root.winfo_width()
             x, y = self.root.winfo_x(), self.root.winfo_y()
@@ -1655,6 +1663,23 @@ class CharacterWindow:
         hb.bind("<Enter>", lambda e: hb.config(fg=TB))
         hb.bind("<Leave>", lambda e: hb.config(fg=btn_fg))
         Tooltip(hb, "History")
+
+        # Mini controls \u2014 visible only when window is collapsed
+        MF  = tkfont.Font(family="Consolas", size=10, weight="bold")
+        MF7 = tkfont.Font(family="Consolas", size=7,  weight="bold")
+        self._hdr_b_go = tk.Label(hdr, text="\u25b6",       fg=CA, font=MF,  bg=BG_H, padx=4, cursor="hand2")
+        self._hdr_b_go.bind("<Button-1>", lambda e: self._go())
+        Tooltip(self._hdr_b_go, "Start")
+        self._hdr_b_pa = tk.Label(hdr, text="\u258c\u258c", fg=TD, font=MF7, bg=BG_H, padx=3, cursor="hand2")
+        self._hdr_b_pa.bind("<Button-1>", lambda e: self._pause())
+        Tooltip(self._hdr_b_pa, "Pause")
+        self._hdr_b_st = tk.Label(hdr, text="\u25a0",       fg=TD, font=MF,  bg=BG_H, padx=4, cursor="hand2")
+        self._hdr_b_st.bind("<Button-1>", lambda e: self._stop())
+        Tooltip(self._hdr_b_st, "Stop")
+        # Register as a btn_set so _update_buttons keeps them in sync
+        self._hdr_btn_set = {"go": self._hdr_b_go, "pa": self._hdr_b_pa, "st": self._hdr_b_st}
+        self._btn_sets.append(self._hdr_btn_set)
+        # Don't pack yet \u2014 shown only when collapsed
 
         # Every child of the title bar is also a drag handle (append \u2014 existing bindings still fire)
         for _w in hdr.winfo_children():
@@ -1795,6 +1820,14 @@ class CharacterWindow:
             self._alert_det_btn.bind("<Enter>", lambda e: self._alert_det_btn.config(bg=BDG))
             self._alert_det_btn.bind("<Leave>", lambda e: self._alert_det_btn.config(bg=BG_P))
             Tooltip(self._alert_det_btn, "Detach")
+
+            # Collapse toggle (left of detach)
+            self._alert_tog_btn = tk.Label(hdr_f, text="\u25BC" if not self._alert_collapsed else "\u25B6",
+                                           font=tkfont.Font(family="Consolas", size=8), bg=BG_P, fg=TD, cursor="hand2")
+            self._alert_tog_btn.pack(side="right", padx=4)
+            self._alert_tog_btn.bind("<Button-1>", lambda e: self._toggle_collapse("alert"))
+            self._alert_tog_btn.bind("<Enter>", lambda e: self._alert_tog_btn.config(fg=TB))
+            self._alert_tog_btn.bind("<Leave>", lambda e: self._alert_tog_btn.config(fg=TD))
         else:
             # Detached header has CLR button too
             hdr_f = tk.Frame(parent, bg=BG_P, height=20)
@@ -1807,8 +1840,12 @@ class CharacterWindow:
             clr_btn.bind("<Leave>", lambda e: clr_btn.config(fg=TD))
             Tooltip(clr_btn, "Clear alerts")
 
-        self._alert_frame = tk.Frame(parent, bg=BG_P)
-        self._alert_frame.pack(fill="both", expand=True, padx=6, pady=(2, 4))
+        self._alert_wrap = tk.Frame(parent, bg=BG_P)
+        if not detached and self._alert_collapsed:
+            pass  # don't pack — collapsed
+        else:
+            self._alert_wrap.pack(fill="both", expand=True, padx=6, pady=(2, 4))
+        self._alert_frame = self._alert_wrap
         tk.Label(self._alert_frame, text="  No alerts", font=F9, bg=BG_P, fg=CM, anchor="w").pack(anchor="w")
         self._last_alert_key = None  # Force redraw on next tick
 
@@ -2508,10 +2545,10 @@ class CharacterWindow:
             collapsed = getattr(self, f"_{section}_collapsed", False)
 
             if enabled:
-                if tog:
-                    tog.pack(side="right", padx=4)
                 if det:
                     det.pack(side="right", padx=2)
+                if tog:
+                    tog.pack(side="right", padx=4)
                 if wrap and not collapsed:
                     wrap.pack(fill="x", **self._get_section_pad(section))
             else:
@@ -2605,7 +2642,10 @@ class CharacterWindow:
             if tog:
                 tog.config(text="\u25BC")
             if wrap:
-                wrap.pack(fill="x", **self._get_section_pad(section))
+                if section == "alert":
+                    wrap.pack(fill="both", expand=True, **self._get_section_pad(section))
+                else:
+                    wrap.pack(fill="x", **self._get_section_pad(section))
         self._fit()
 
     # Crée un en-tête de section coloré générique
@@ -3720,10 +3760,10 @@ class MainUISettings:
 
         saved = cfg.get("main_ui", {}).get("settings_pos", "")
         if saved:
-            self.w.geometry(f"340x290{saved}")
+            self.w.geometry(f"340x320{saved}")
         else:
             self.w.geometry(
-                f"340x290+{parent_root.winfo_x()+30}+{parent_root.winfo_y()+40}")
+                f"340x320+{parent_root.winfo_x()+30}+{parent_root.winfo_y()+40}")
 
         hdr = tk.Frame(self.w, bg=BG_H, height=32)
         hdr.pack(fill="x")
@@ -3787,6 +3827,23 @@ class MainUISettings:
             font=tkfont.Font(family="Consolas", size=9),
             values=THEME_NAMES)
         self._theme_cb.pack(fill="x", pady=(0, 8))
+
+        r3 = tk.Frame(body, bg=BG_POP)
+        r3.pack(fill="x", pady=(0, 8))
+        self.bgm_var = tk.BooleanVar(value=cfg.get("bg_monitor", False))
+        bgm_lbl = tk.Label(r3, text="BACKGROUND MONITORING", font=lf, bg=BG_POP, fg=TD)
+        bgm_lbl.pack(side="left")
+        self._bgm_box = tk.Label(r3, text="☑" if self.bgm_var.get() else "☐",
+                                 font=tkfont.Font(family="Consolas", size=12),
+                                 bg=BG_POP, fg=CA if self.bgm_var.get() else TD,
+                                 cursor="hand2")
+        self._bgm_box.pack(side="right")
+        def _toggle_bgm(e=None):
+            self.bgm_var.set(not self.bgm_var.get())
+            on = self.bgm_var.get()
+            self._bgm_box.config(text="☑" if on else "☐", fg=CA if on else TD)
+        self._bgm_box.bind("<Button-1>", _toggle_bgm)
+        bgm_lbl.bind("<Button-1>", _toggle_bgm)
 
         ap = tk.Label(body, text="✔ APPLY",
                       font=tkfont.Font(family="Consolas", size=10, weight="bold"),
@@ -3903,6 +3960,8 @@ class MainUISettings:
                         win._update_buttons()
                     except Exception:
                         pass
+
+        cfg["bg_monitor"] = self.bgm_var.get()
 
         save_config(cfg)
 
@@ -4495,7 +4554,7 @@ class MainUI:
             suspended = getattr(win, "_suspended", False)
             vis       = win.root.winfo_viewable()
 
-            # Hidden (suspended) characters: show what they already earned, nothing more
+            # Suspended (hidden + bg_monitor OFF): show last earned, mark offline
             if suspended:
                 d       = win.data
                 net_tot = d.bg * (1 - d.tax) + d.loot_val
@@ -4504,6 +4563,9 @@ class MainUI:
                 self._tv_set(char_id, "isk_hr",  "— OFFLINE —")
                 self._tv_set(char_id, "session", fdur(d.acc_sec) if d.acc_sec > 0 else "00:00:00")
                 continue
+
+            # Hidden but still monitored (bg_monitor ON): fall through to live data display below.
+            # vis=False already causes _tv_tag to use the dimmed/hidden style.
 
             frozen = (now - getattr(win, "_last_tick_wall", now)) > 1.5
             if frozen:
@@ -4554,6 +4616,8 @@ class MainUI:
             return
         char_cfg = self.cfg.setdefault("chars", {}).setdefault(char_id, {})
 
+        bg_monitor = self.cfg.get("bg_monitor", False)
+
         if win.root.winfo_viewable():
             # HIDE — withdraw main + all detached panels (keep widgets alive for _tick)
             panels = [("isk", "_isk_window"), ("dps", "_dps_window"),
@@ -4572,7 +4636,11 @@ class MainUI:
             win._hidden_detached = was_detached
             win.root.withdraw()
             char_cfg["show"] = False
-            win._suspended = True          # stop log reading for this character
+            if bg_monitor:
+                # Keep monitoring — only hide the UI, don't suspend log reading
+                win._suspended = False
+            else:
+                win._suspended = True      # stop log reading for this character
             if char_id in self._rows:
                 self._tv_cache.pop((char_id, "__tag__"), None)
                 self._tv_tag(char_id, "standby", False)
