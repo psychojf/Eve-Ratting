@@ -90,13 +90,17 @@ It does NOT touch the EVE client, network traffic or memory.
                 (bounties after tax + loot value)
     ISK/HR      Net ISK per hour (bounties + loot, annualised)
     SESSION     Elapsed session time (HH:MM:SS)
+    DPS         Open/close this character's DPS overlay
+                (see "THE DPS OVERLAY" at the end of this section)
 
   Row colours:
     Green ★     Character window is visible — data tracking ON
     Orange ★    Character window is hidden  — data tracking OFF
 
-  Click anywhere on a row to TOGGLE that character's window
-  (show/hide). The ★ in the character name acts as the button.
+  Click any cell EXCEPT the DPS cell to TOGGLE that character's
+  dashboard window (show/hide). Click the DPS cell to open or
+  close that character's DPS overlay; right-click the DPS cell
+  for the overlay menu (Reposition / View / Close).
 
   When a character is hidden (orange):
     - Log polling is suspended immediately
@@ -110,11 +114,41 @@ It does NOT touch the EVE client, network traffic or memory.
     ✕   Quit all windows
 
   Double-click the title bar to collapse the overview to just
-  its header bar. Drag the bottom-right grip to resize.
+  its header bar. Drag the bottom-right grip to resize the
+  window, or drag a column separator in the header row to resize
+  a column — window size/position and column widths are all
+  remembered between sessions.
 
   FLEET TOTAL row (shown when 2+ chars are ratting):
     Left value    Combined TOTAL NET across all active chars
     Right value   Combined ISK/HR across all active chars
+
+  THE DPS OVERLAY
+  ---------------
+  Each character can have a standalone DPS overlay that floats
+  over your ship, independent of the dashboard window — like
+  EVE's own combat "messages" frame: just the DPS OUT (blue) and
+  DPS IN (red) numbers over the game, with no window box.
+
+    Open / close    Left-click the DPS cell in the overview.
+    Menu            Right-click the DPS cell:
+                      Reposition   — re-enter move mode
+                      View ▸  Numbers / Graph / Numbers+graph
+                      Close overlay
+    Row glyph       ○ closed    ◉ placed    ✜ move mode
+
+  A brand-new overlay opens in MOVE MODE: a white outline with an
+  ✕ in the corner plus a resize grip. Drag it (grab the numbers
+  or the outline) over your ship, resize with the corner grip,
+  then click ✕ to SET it. Once set, the box disappears — only the
+  text remains and the overlay becomes CLICK-THROUGH, so your
+  mouse passes straight to EVE. To move it again, right-click the
+  DPS cell and choose Reposition.
+
+  Position, size, view and placed/move state are remembered per
+  character. Transparency and click-through are Windows-only, and
+  a topmost overlay draws over EVE only in Fixed-Window or
+  Borderless mode (not exclusive fullscreen).
 
 ----------------------------------------------------------------
  6. FLEET MANAGER (◈)
@@ -147,9 +181,11 @@ It does NOT touch the EVE client, network traffic or memory.
   ALERTS        EWAR / escalation / loot feed (with CLR button)
   ISK TRACKER   ISK/hour + session timer + breakdown
   MISSIONS      Mission name, objective status, mission count,
-                storyline progress (or ANOMALY TRACKER — see §9)
-  DPS           Outgoing / incoming DPS (15-second window),
-                total damage dealt/received, hits and misses
+                storyline progress (or ANOMALY TRACKER — see §11)
+
+  (Live DPS is no longer a dashboard section — it now lives in
+  the standalone DPS overlay, opened from the overview's DPS
+  cell. See "THE DPS OVERLAY" in §5.)
 
   Each section header has:
     ON/OFF      Toggle the section on or off
@@ -159,7 +195,9 @@ It does NOT touch the EVE client, network traffic or memory.
   Double-click the title bar to collapse the whole window
   to just the header bar. Double-click again to restore.
 
-  Drag from the bottom-right corner grip to resize any window.
+  The dashboard window auto-sizes to its content and is NOT
+  resizable; the grip in its bottom status bar is decorative.
+  (The overview window and detached panels ARE resizable.)
 
 ----------------------------------------------------------------
  8. CONTROLS
@@ -282,6 +320,9 @@ It does NOT touch the EVE client, network traffic or memory.
 
   Detached panels also scale their content when resized (the
   ALERTS panel adjusts font size automatically).
+
+  (DPS is no longer a detachable panel — it now has its own
+  standalone overlay instead; see "THE DPS OVERLAY" in §5.)
 
 ----------------------------------------------------------------
  15. SETTINGS

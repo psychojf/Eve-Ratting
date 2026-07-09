@@ -4,7 +4,7 @@ import tkinter as tk
 from tkinter import ttk, font as tkfont
 import os, re, json, time, threading, urllib.request, traceback
 from datetime import datetime, timedelta, timezone
-from collections import defaultdict, deque
+from collections import deque
 
 if sys.stdout is not None:
     sys.stdout.reconfigure(encoding='utf-8')
@@ -26,6 +26,25 @@ try:
     _TRAY_OK = True
 except ImportError as e:
     pass
+
+# Optional: event-driven log watching. Falls back to timer polling when absent,
+# so the pre-built .exe (no watchdog bundled) behaves exactly as before.
+try:
+    from watchdog.observers import Observer
+    from watchdog.events import FileSystemEventHandler
+    _WATCHDOG_OK = True
+except ImportError:
+    _WATCHDOG_OK = False
+    Observer = None
+    class FileSystemEventHandler:   # fallback base so _LogEventHandler still defines
+        pass
+
+# Optional: audio EWAR alerts (winsound is Windows-only stdlib)
+try:
+    import winsound
+    _SND_OK = True
+except ImportError:
+    _SND_OK = False
 
 # ── Colors ───────────────────────────────────────────────────────────
 BG       = "#080808"    # Main background (deep carbon)
@@ -188,6 +207,16 @@ CONFIG_FILE  = os.path.join(_BASE, "ratting_config.json")
 HISTORY_FILE = os.path.join(_BASE, "ratting_history.json")
 PRICE_CACHE  = os.path.join(_BASE, "ratting_prices.json")
 NAMEID_CACHE = os.path.join(_BASE, "ratting_nameids.json")
+
+# ESI politely requests a descriptive User-Agent; anonymous requests get throttled/blocked.
+_ESI_UA = "Eve-Ratting/1.0 (+https://github.com/psychojf/Eve-Ratting)"
+
+# Serializes the shared market-price cache download/write across all CharacterWindows,
+# so only one thread fetches ESI and writes ratting_prices.json (the rest load what it wrote).
+_PRICE_LOCK = threading.Lock()
+# Guards the shared name→type_id cache file against concurrent loot-thread writes.
+_NAMEID_LOCK = threading.Lock()
+
 def _find_eve_log_path(subdir):
     """Return the first existing EVE log path across Windows, Linux native, and Linux/Proton."""
     candidates = [
@@ -219,6 +248,17 @@ WIN_W        = 290
 MAX_ALERTS   = 5     # Max mission/alert feed entries to display
 ANOM_GAP     = 45    # Seconds of no combat = site boundary (warp gap)
 BACKFILL_MINS = 15   # On Play, scan gamelog for bounties from last N minutes
+DPS_GRAPH_W  = 120   # Fenêtre du graphique d'historique DPS (en secondes)
+DPS_GRAPH_H  = 50    # Hauteur du graphique intégré en pixels
+
+# ── DPS overlay transparency ─────────────────────────────────────────
+# Color-key: any widget painted this exact color renders fully transparent
+# under Windows -transparentcolor, so only text/graph lines show over EVE.
+# Dark so anti-alias fringe on text edges blends into EVE's space backdrop.
+OVERLAY_KEY     = "#010101"
+# Solid backdrop shown ONLY while repositioning (move mode) so the whole
+# frame is grabbable in every view; reverts to OVERLAY_KEY once placed.
+OVERLAY_MOVE_BG = "#0d0d12"
 
 # ── Log filename / header patterns ───────────────────────────────────
 RE_CF = re.compile(r'^(\d{8})_(\d{6})_(\d+)\.txt$')           # combat log filename
@@ -311,6 +351,53 @@ def ptail(t):
     if len(p) >= 2: return p[0], p[-1]
     return ("Unknown", p[0]) if p else ("Unknown", "Hits")
 
+
+# Dessine les polylignes d'historique DPS (OUT/IN) sur un Canvas Tk.
+# Partagé par le panneau DPS détaché et l'overlay DPS autonome.
+def draw_dps_graph(canvas, hist, *, is_detached=False):
+    """Draw OUT/IN DPS history polylines onto `canvas` from a deque of
+    (monotonic_ts, dps_out, dps_in). Caller guarantees canvas exists/viewable."""
+    w = canvas.winfo_width()
+    h = canvas.winfo_height()
+    if w < 10 or h < 10:
+        return
+    canvas.delete("all")
+    if len(hist) < 2:
+        return
+    now = time.monotonic()
+    cutoff = now - DPS_GRAPH_W
+    pts = [(t, do, di) for t, do, di in hist if t >= cutoff]
+    if len(pts) < 2:
+        return
+    max_dps = max(max(do for _, do, _ in pts), max(di for _, _, di in pts), 100)
+    y_max = max_dps * 1.1
+    pad_x, pad_y = 2, 3
+    gw = w - pad_x * 2
+    gh = h - pad_y * 2
+    t_start = cutoff
+    t_span = DPS_GRAPH_W
+    def _px(t, v):
+        x = pad_x + ((t - t_start) / t_span) * gw
+        y = pad_y + gh - (v / y_max) * gh
+        return x, y
+    for frac in (0.25, 0.50, 0.75):
+        gy = pad_y + gh - frac * gh
+        canvas.create_line(pad_x, gy, w - pad_x, gy, fill=BD, dash=(2, 4), tags="grid")
+    coords_out = []
+    coords_in = []
+    for t, do, di in pts:
+        ox, oy = _px(t, do)
+        ix, iy = _px(t, di)
+        coords_out.extend([ox, oy])
+        coords_in.extend([ix, iy])
+    if any(v > 0 for _, _, v in pts):
+        canvas.create_line(*coords_in, fill=_dim(CR, 0.4), width=1, smooth=True, tags="line_in")
+    if any(v > 0 for _, v, _ in pts):
+        canvas.create_line(*coords_out, fill=CD, width=2 if is_detached else 1, smooth=True, tags="line_out")
+    if is_detached and h > 40:
+        canvas.create_text(pad_x + 2, pad_y + 2, text=f"{max_dps:,.0f}",
+                           font=("Consolas", 7), fill=TD, anchor="nw", tags="label")
+
 # Lit le nom du personnage dans l'en-tête du fichier log
 def rlisten(fp):
     try:
@@ -325,7 +412,8 @@ def rlisten(fp):
 
 # Scanne récursivement le dossier pour trouver les logs de combat par personnage
 def scan_logs(base):
-    r = {}
+    r = {}          # char_id → newest log path
+    mt = {}         # char_id → that path's mtime (avoids re-stat'ing on each compare)
     if not os.path.isdir(base): return r
     for dp, dn, fns in os.walk(base):
         for fn in fns:
@@ -333,8 +421,10 @@ def scan_logs(base):
             if m:
                 c = m.group(3)
                 fp = os.path.join(dp, fn)
-                if c not in r or os.path.getmtime(fp) > os.path.getmtime(r[c]):
+                fmt = os.path.getmtime(fp)
+                if c not in r or fmt > mt[c]:
                     r[c] = fp
+                    mt[c] = fmt
     return r
 
 # Charge la configuration JSON depuis le disque
@@ -397,7 +487,7 @@ def save_session(data, char_name, tax_pct):
         "last_mission":  data.mission_name or "",
         "sites_cleared": len(data.anom_completed),
         "avg_site_time": int(sum(
-            (a["end"] - a["start"]).total_seconds()
+            max(0, (a["end"] - a["start"]).total_seconds())
             for a in data.anom_completed if a["end"] and a["start"]
         ) / max(len(data.anom_completed), 1)),
         "avg_site_isk":  int(sum(a["isk"] for a in data.anom_completed)
@@ -496,32 +586,33 @@ class Data:
         self.t0 = None
         self.acc_sec = 0.0
         self.dd = self.dr = 0
-        self.hd = self.hr = self.md = self.mr = 0
-        self.bp = self.bg = 0
+        self.hd = self.md = 0           # Coups réussis sortants / coups manqués sortants
+        self.bg = 0                     # Bounties brutes accumulées
         self.tax = DEF_TAX / 100
-        self.bc = 0
-        self.loot_val = 0               # Total loot estimated value
-        self.fb = None
-        self.pkd = self.pkr = 0
+        self.bc = 0                     # Compteur de kills (bounties reçues)
+        self.loot_val = 0               # Valeur totale estimée du loot
+        self.pkd = self.pkr = 0         # Pics DPS sortants / entrants
 
-        # Mission tracking
-        self.mission_name = None        # Current mission name (from chatlog)
-        self.mission_obj_met = False    # Objective accomplished flag
-        self.missions_done = 0          # Missions completed this session
-        self.storyline_ctr = 0          # Running counter toward storyline (16)
-        self.standings = []             # [(faction, amount), ...]
+        # Suivi de mission
+        self.mission_name = None        # Nom de la mission en cours (chatlog)
+        self.mission_obj_met = False    # Drapeau « objectif accompli »
+        self.missions_done = 0          # Missions terminées cette session
         self.alerts = deque(maxlen=MAX_ALERTS)  # [(timestamp_str, type, text), ...]
 
-        # Anomaly tracking
-        self.anom_current = None         # dict for active anomaly (or None)
-        self.anom_completed = []         # list of completed anomaly dicts
-        self.anom_last_combat = None     # datetime of last combat event (UTC)
+        # Suivi des anomalies
+        self.anom_current = None         # dict de l'anomalie active (ou None)
+        self.anom_completed = []         # liste des anomalies terminées
+        self.anom_last_combat = None     # datetime du dernier événement de combat (UTC)
 
-        # Deque + running sum for O(1) DPS calc
-        self.ed = deque(maxlen=1000)     # (ts, dmg) out
-        self.er = deque(maxlen=1000)     # (ts, dmg) in
+        # Deque + somme glissante pour calcul DPS en O(1)
+        self.ed = deque(maxlen=1000)     # (ts, dmg) sortant
+        self.er = deque(maxlen=1000)     # (ts, dmg) entrant
         self.ed_sum = 0
         self.er_sum = 0
+
+        # Historique DPS pour le graphique (échantillonné à chaque tick)
+        # Chaque entrée : (monotonic_ts, dps_out, dps_in)
+        self.dps_hist = deque(maxlen=int(DPS_GRAPH_W * 1000 / DEF_POLL) + 1)
 
     # Retourne le nombre de secondes totales de la session
     def secs(self):
@@ -550,6 +641,10 @@ class Data:
 
     # Enregistre un coup sortant et met à jour les totaux
     def add_dmg_out(self, ts, dmg):
+        # If the deque is full, append() silently evicts ed[0]; subtract it from
+        # the running sum first so ed_sum stays == sum(dmg in ed) (O(1) invariant).
+        if len(self.ed) == self.ed.maxlen:
+            self.ed_sum -= self.ed[0][1]
         self.ed.append((time.monotonic(), dmg))
         self.ed_sum += dmg
         self.dd += dmg
@@ -557,14 +652,11 @@ class Data:
 
     # Enregistre un coup reçu et met à jour les totaux
     def add_dmg_in(self, ts, dmg):
+        if len(self.er) == self.er.maxlen:
+            self.er_sum -= self.er[0][1]
         self.er.append((time.monotonic(), dmg))
         self.er_sum += dmg
         self.dr += dmg
-        self.hr += 1
-
-    # Méthode vide — le nettoyage est fait en direct dans dps()
-    def trim(self):
-        pass  # handled live in dps()
 
     # Calcule l'ISK/heure nette (bounties - taxes + loot)
     def isk(self):
@@ -679,7 +771,11 @@ class HistoryWindow:
             except Exception:
                 pass
         
-        self._scroll_binding = canvas.bind_all("<MouseWheel>", _safe_scroll)
+        # Scope the global wheel hijack to when the cursor is actually over the
+        # history list (matches FleetManager's Enter/Leave pattern), so opening
+        # or closing History can't clobber other windows' scroll handling.
+        canvas.bind("<Enter>", lambda e: canvas.bind_all("<MouseWheel>", _safe_scroll))
+        canvas.bind("<Leave>", lambda e: canvas.unbind_all("<MouseWheel>"))
         self._canvas = canvas  # Store reference for cleanup
 
         F8  = tkfont.Font(family="Consolas", size=8)
@@ -916,8 +1012,6 @@ class Settings:
             # Apply opacity to any active detached windows
             if a._isk_window and a._isk_window.w.winfo_exists():
                 a._isk_window.w.attributes("-alpha", a.alpha)
-            if a._dps_window and a._dps_window.w.winfo_exists():
-                a._dps_window.w.attributes("-alpha", a.alpha)
             if a._msn_window and a._msn_window.w.winfo_exists():
                 a._msn_window.w.attributes("-alpha", a.alpha)
             if a._anom_window and a._anom_window.w.winfo_exists():
@@ -1044,13 +1138,13 @@ class DetachedWindow:
         req_h = self.body.winfo_reqheight() + 40
         
         if saved:
-
-            # Parse saved geometry for position, use saved size if available
             geo_key = f"{section_key}_detach_geo"
             saved_geo = app.char_cfg.get(geo_key)
             if saved_geo:
+                # Restaure la taille exacte sauvegardée + la position
                 self.w.geometry(f"{saved_geo}{saved}")
             else:
+                # Première ouverture : taille calculée depuis le contenu
                 self.w.geometry(f"{req_w}x{req_h}{saved}")
         else:
             self.w.geometry(f"{req_w}x{req_h}")
@@ -1098,6 +1192,326 @@ class DetachedWindow:
         self.app._reattach(self.section_key)
 
 
+# ── Standalone DPS overlay ───────────────────────────────────────────
+# Overlay DPS autonome (indépendant du dashboard) : transparent, déplaçable,
+# verrouillable en click-through, 3 vues (nombres / graphe / les deux).
+class DPSOverlay:
+    VIEW_NUMBERS, VIEW_GRAPH, VIEW_BOTH = 0, 1, 2
+    _VIEW_COUNT = 3
+
+    def __init__(self, main_ui, win):
+        self.mu = main_ui
+        self.win = win
+        self.cfg = win.cfg
+        self.char_cfg = win.char_cfg
+        self.view = int(self.char_cfg.get("dps_overlay_view", self.VIEW_NUMBERS)) % self._VIEW_COUNT
+        self.locked = False
+        self._job = None
+        self._dx = self._dy = 0
+        self._rw = self._rh = self._rx = self._ry = self._wx = self._wy = 0
+        self._scaling = False
+        self._last_scale_h = 0
+        self._out_lbl = self._in_lbl = self._graph = None
+
+        self.w = tk.Toplevel(main_ui.root)
+        self.w.overrideredirect(True)
+        self.w.configure(bg=OVERLAY_KEY, highlightthickness=0)
+        self.w.attributes("-topmost", True)
+        self.w.attributes("-alpha", 1.0)   # crisp text; independent of global opacity
+        try:
+            # Color-key the background fully transparent (Windows). Only text /
+            # graph lines show over EVE, like a message frame. Ignored off-Windows.
+            self.w.attributes("-transparentcolor", OVERLAY_KEY)
+        except Exception:
+            pass
+
+        saved_pos = self.char_cfg.get("dps_overlay_pos")
+        saved_geo = self.char_cfg.get("dps_overlay_geo")
+        if saved_geo and saved_pos:
+            self.w.geometry(f"{saved_geo}{saved_pos}")
+        elif saved_pos:
+            self.w.geometry(f"230x96{saved_pos}")
+        else:
+            self.w.geometry(f"230x96+{main_ui.root.winfo_x()+60}+{main_ui.root.winfo_y()+60}")
+
+        # Reusable fonts (rescaled on resize)
+        self._num_font   = tkfont.Font(family="Consolas", size=22, weight="bold")
+        self._title_font = tkfont.Font(family="Consolas", size=8,  weight="bold")
+
+        self._build_chrome()
+        self._build_view()
+        self.w.after(120, self._finalize_scale)
+        self._refresh()
+
+        # Fresh overlay (no saved position) opens in MOVE mode so the owner can
+        # place it; a restored one comes back placed (SET mode) as clean text.
+        if saved_pos:
+            self.locked = bool(self.char_cfg.get("dps_overlay_locked", True))
+        else:
+            self.locked = False
+        self.w.update_idletasks()
+        self._apply_mode()
+
+    # ── Chrome: transparent body + move-mode contour / ✕ / grip (no header) ──
+    def _build_chrome(self):
+        self.body = tk.Frame(self.w, bg=OVERLAY_KEY)
+
+        # ✕ = set position (exit move mode). Top-right, visible only while moving.
+        self._xbtn = tk.Label(self.w, text="✕",
+                              font=tkfont.Font(family="Consolas", size=10, weight="bold"),
+                              bg=OVERLAY_MOVE_BG, fg="#ffffff", cursor="hand2")
+        self._xbtn.bind("<Button-1>", lambda e: self.toggle_lock(force=True))
+
+        # Resize grip, bottom-right, visible only while moving.
+        self._grip = tk.Label(self.w, text="⤡",
+                              font=tkfont.Font(family="Consolas", size=9),
+                              bg=OVERLAY_MOVE_BG, fg="#ffffff", cursor="bottom_right_corner")
+        self._grip.bind("<Button-1>", self._resize_start)
+        self._grip.bind("<B1-Motion>", self._resize_drag)
+        self._grip.bind("<ButtonRelease-1>", self._resize_end)
+
+        # Drag the window by grabbing the body (guarded to move mode in _drag).
+        self.body.bind("<Button-1>", self._drag_start)
+        self.body.bind("<B1-Motion>", self._drag)
+        self.body.bind("<ButtonRelease-1>", lambda e: self._save_geo())
+
+        self.body.pack(fill="both", expand=True)
+        self.body.bind("<Configure>", self._on_resize)
+
+    def _build_view(self):
+        for c in self.body.winfo_children():
+            c.destroy()
+        self._out_lbl = self._in_lbl = self._graph = None
+        if self.view == self.VIEW_NUMBERS:
+            self._build_numbers(self.body, inline=False)
+        elif self.view == self.VIEW_GRAPH:
+            self._graph = tk.Canvas(self.body, bg=OVERLAY_KEY, highlightthickness=0, bd=0)
+            self._graph.pack(fill="both", expand=True, padx=3, pady=3)
+        else:  # VIEW_BOTH
+            top = tk.Frame(self.body, bg=OVERLAY_KEY)
+            top.pack(fill="x", padx=3, pady=(3, 0))
+            self._build_numbers(top, inline=True)
+            self._graph = tk.Canvas(self.body, bg=OVERLAY_KEY, highlightthickness=0, bd=0)
+            self._graph.pack(fill="both", expand=True, padx=3, pady=(2, 3))
+        # New children must match the current mode's backdrop (keyed vs move).
+        self._set_body_bg(OVERLAY_MOVE_BG if not self.locked else OVERLAY_KEY)
+
+    def _build_numbers(self, parent, inline=False):
+        def _bind_drag(*widgets):
+            for _w in widgets:
+                _w.bind("<Button-1>", self._drag_start)
+                _w.bind("<B1-Motion>", self._drag)
+                _w.bind("<ButtonRelease-1>", lambda e: self._save_geo())
+        if inline:
+            of = tk.Frame(parent, bg=OVERLAY_KEY); of.pack(side="left", expand=True, fill="x")
+            t1 = tk.Label(of, text="▸ OUT", font=self._title_font, bg=OVERLAY_KEY, fg=CD, anchor="w")
+            t1.pack(anchor="w")
+            self._out_lbl = tk.Label(of, text="0", font=self._num_font, bg=OVERLAY_KEY, fg=CD, anchor="w")
+            self._out_lbl.pack(anchor="w")
+            inf = tk.Frame(parent, bg=OVERLAY_KEY); inf.pack(side="right", expand=True, fill="x")
+            t2 = tk.Label(inf, text="IN ◂", font=self._title_font, bg=OVERLAY_KEY, fg=CR, anchor="e")
+            t2.pack(anchor="e")
+            self._in_lbl = tk.Label(inf, text="0", font=self._num_font, bg=OVERLAY_KEY, fg=CR, anchor="e")
+            self._in_lbl.pack(anchor="e")
+            _bind_drag(of, t1, self._out_lbl, inf, t2, self._in_lbl)
+        else:
+            orow = tk.Frame(parent, bg=OVERLAY_KEY); orow.pack(fill="x", padx=4, pady=(3, 0))
+            t1 = tk.Label(orow, text="▸ OUT", font=self._title_font, bg=OVERLAY_KEY, fg=CD, anchor="w")
+            t1.pack(side="left")
+            self._out_lbl = tk.Label(orow, text="0", font=self._num_font, bg=OVERLAY_KEY, fg=CD, anchor="e")
+            self._out_lbl.pack(side="right")
+            irow = tk.Frame(parent, bg=OVERLAY_KEY); irow.pack(fill="x", padx=4, pady=(0, 3))
+            t2 = tk.Label(irow, text="◂ IN", font=self._title_font, bg=OVERLAY_KEY, fg=CR, anchor="w")
+            t2.pack(side="left")
+            self._in_lbl = tk.Label(irow, text="0", font=self._num_font, bg=OVERLAY_KEY, fg=CR, anchor="e")
+            self._in_lbl.pack(side="right")
+            _bind_drag(orow, t1, self._out_lbl, irow, t2, self._in_lbl)
+
+    def _refresh(self):
+        try:
+            d = self.win.data
+            if self._out_lbl is not None:
+                self._out_lbl.config(text=f"{d.dps(True):,.0f}")
+            if self._in_lbl is not None:
+                self._in_lbl.config(text=f"{d.dps(False):,.0f}")
+            if self._graph is not None:
+                self._redraw_graph()
+        except Exception:
+            pass
+        try:
+            self._job = self.w.after(getattr(self.win, "poll_ms", DEF_POLL), self._refresh)
+        except Exception:
+            self._job = None
+
+    def _redraw_graph(self):
+        try:
+            if self._graph.winfo_exists() and self._graph.winfo_viewable():
+                draw_dps_graph(self._graph, self.win.data.dps_hist, is_detached=True)
+        except Exception:
+            pass
+
+    # ── Views ──
+    def cycle_view(self):
+        self.set_view((self.view + 1) % self._VIEW_COUNT)
+
+    def set_view(self, i):
+        self.view = i % self._VIEW_COUNT
+        self.char_cfg["dps_overlay_view"] = self.view
+        save_config(self.cfg)
+        self._build_view()
+        self._last_scale_h = 0
+        self.w.after(30, self._apply_scale)
+
+    # ── Resize scaling ──
+    def _on_resize(self, event):
+        if self._scaling:
+            return
+        h = event.height
+        if abs(h - self._last_scale_h) < 8:
+            return
+        self._last_scale_h = h
+        self._apply_scale(h)
+
+    def _finalize_scale(self):
+        try:
+            if self.w.winfo_exists():
+                self._last_scale_h = 0
+                self._apply_scale()
+        except Exception:
+            pass
+
+    def _apply_scale(self, h=None):
+        if self._scaling:
+            return
+        self._scaling = True
+        try:
+            if h is None:
+                h = self.body.winfo_height()
+            if h < 8:
+                return
+            base = 60 if self.view == self.VIEW_BOTH else 44
+            scale = max(0.5, min(3.0, h / base))
+            self._num_font.configure(size=max(10, min(48, int(20 * scale))))
+            self._title_font.configure(size=max(7, min(12, int(8 * scale))))
+            if self._graph is not None:
+                self._redraw_graph()
+        finally:
+            self._scaling = False
+
+    # ── Set / move mode ──
+    def toggle_lock(self, force=None):
+        """locked=True → set mode (placed, pure text, click-through);
+        locked=False → move mode (solid frame, white contour, ✕ + grip)."""
+        self.locked = (not self.locked) if force is None else bool(force)
+        self._apply_mode()
+        self.char_cfg["dps_overlay_locked"] = self.locked
+        save_config(self.cfg)
+        try:
+            self.mu._reflect_overlay_state(self.win.char_id)
+        except Exception:
+            pass
+
+    def _set_body_bg(self, color):
+        """Recolour body + all descendants (frames/labels/canvas) to `color`.
+        Solid OVERLAY_MOVE_BG while moving (grabbable), OVERLAY_KEY when placed."""
+        stack = [self.body]
+        while stack:
+            w = stack.pop()
+            try:
+                w.configure(bg=color)
+            except Exception:
+                pass
+            stack.extend(w.winfo_children())
+
+    def _apply_mode(self):
+        """Apply the chrome for the current mode (self.locked)."""
+        move = not self.locked
+        # Solid movable frame while moving; keyed-transparent pure text once placed.
+        self._set_body_bg(OVERLAY_MOVE_BG if move else OVERLAY_KEY)
+        try:
+            if move:
+                self.w.configure(highlightthickness=2,
+                                 highlightbackground="#ffffff", highlightcolor="#ffffff")
+                self._xbtn.place(relx=1.0, x=-3, y=1, anchor="ne")
+                self._grip.place(relx=1.0, rely=1.0, x=-2, y=-2, anchor="se")
+            else:
+                self.w.configure(highlightthickness=0)
+                self._xbtn.place_forget()
+                self._grip.place_forget()
+        except Exception:
+            pass
+        # Windows click-through only in set mode (clicks pass to EVE over the text).
+        if sys.platform == "win32":
+            try:
+                import ctypes
+                GWL_EXSTYLE = -20
+                WS_EX_LAYERED = 0x00080000
+                WS_EX_TRANSPARENT = 0x00000020
+                hwnd = ctypes.windll.user32.GetParent(self.w.winfo_id())
+                style = ctypes.windll.user32.GetWindowLongW(hwnd, GWL_EXSTYLE)
+                if self.locked:
+                    style = style | WS_EX_LAYERED | WS_EX_TRANSPARENT
+                else:
+                    style = style & ~WS_EX_TRANSPARENT
+                ctypes.windll.user32.SetWindowLongW(hwnd, GWL_EXSTYLE, style)
+            except Exception:
+                pass
+
+    # ── Drag / resize / geometry ──
+    def _drag_start(self, e):
+        if self.locked:
+            return
+        self._dx, self._dy = e.x, e.y
+
+    def _drag(self, e):
+        if self.locked:
+            return
+        self.w.geometry(f"+{self.w.winfo_x()+e.x-self._dx}+{self.w.winfo_y()+e.y-self._dy}")
+
+    def _resize_start(self, e):
+        self._rw = self.w.winfo_width(); self._rh = self.w.winfo_height()
+        self._rx = e.x_root; self._ry = e.y_root
+        self._wx = self.w.winfo_x(); self._wy = self.w.winfo_y()
+
+    def _resize_drag(self, e):
+        nw = max(120, self._rw + (e.x_root - self._rx))
+        nh = max(60,  self._rh + (e.y_root - self._ry))
+        self.w.geometry(f"{nw}x{nh}+{self._wx}+{self._wy}")
+
+    def _resize_end(self, e):
+        self._save_geo()
+
+    def _save_geo(self):
+        try:
+            self.char_cfg["dps_overlay_geo"] = f"{self.w.winfo_width()}x{self.w.winfo_height()}"
+            self.char_cfg["dps_overlay_pos"] = f"+{self.w.winfo_x()}+{self.w.winfo_y()}"
+            save_config(self.cfg)
+        except Exception:
+            pass
+
+    def apply_alpha(self, a):
+        # Overlay transparency is the color-key (background), independent of the
+        # global opacity slider. Intentionally a no-op so the slider never fades it.
+        return
+
+    def close(self):
+        if self._job:
+            try: self.w.after_cancel(self._job)
+            except Exception: pass
+            self._job = None
+        self._save_geo()
+        self.char_cfg["dps_overlay_open"] = False
+        save_config(self.cfg)
+        try:
+            self.w.destroy()
+        except Exception:
+            pass
+        try:
+            self.mu._on_overlay_closed(self.win.char_id)
+        except Exception:
+            pass
+
+
 # ── Main app ─────────────────────────────────────────────────────────
 # Application principale du dashboard de ratting EVE Online
 class CharacterWindow:
@@ -1131,12 +1545,17 @@ class CharacterWindow:
         self._full_height = 0       # Store height before collapse
         self._main_frame = None     # Reference to body frame for collapse
         self._dragging = False      # Distinguish drag vs double-click on titlebar
+        self._overlay_active = False  # True while a DPS overlay is open → don't suspend parsing
         self.cf = log_file if log_file else None
         self.fh = None
         self.fp = 0
+        self._last_gamelog_scan = 0.0   # monotonic ts of last gamelog-rotation scan
         self._sw  = None
         self._hw = None
         self._calc_dots = 0
+        self._poll_job = None        # after() id for the log-polling loop
+        self._tick_job = None        # after() id for the UI-refresh loop
+        self._alert_font_cache = {}  # size -> tkfont.Font, reused across redraws
 
         self._chat_file = None
         self._chat_fh = None
@@ -1150,13 +1569,14 @@ class CharacterWindow:
 
         # Loot loading indicator state
         self._loot_loading    = False
+        self._loot_inflight   = False   # one loot lookup at a time per window
         self._loot_anim_job   = None
         self._loot_anim_step  = 0
 
         # ── Load or Download Market Prices (24h disk cache) ──
         threading.Thread(target=self._download_market_data, daemon=True).start()
 
-        self._storyline_ctr = self.cfg.get("storyline_counter", 0)
+        self._storyline_ctr = self.char_cfg.get("storyline_counter", 0)
         self.tax_var = tk.StringVar(value=self.cfg.get("tax", str(DEF_TAX)))
 
         self._frozen = None
@@ -1169,8 +1589,6 @@ class CharacterWindow:
 
         self._isk_detached = False
         self._isk_window = None
-        self._dps_detached = False
-        self._dps_window = None
         self._msn_detached = False
         self._msn_window = None
         self._anom_detached = False
@@ -1178,28 +1596,26 @@ class CharacterWindow:
         self._alert_detached = False
         self._alert_window = None
         self._isk_det_labels = {}
-        self._dps_det_labels = {}
         self._msn_det_labels = {}
         self._anom_det_labels = {}
 
-        # Section enabled states (ON/OFF)
-        self._isk_enabled  = self.cfg.get("isk_enabled", True)
-        self._msn_enabled  = self.cfg.get("msn_enabled", True)
-        self._anom_enabled = self.cfg.get("anom_enabled", False)
+        # Section enabled states (ON/OFF) — per character, falling back to any
+        # legacy global value so existing configs migrate without surprises.
+        self._isk_enabled  = self.char_cfg.get("isk_enabled",  self.cfg.get("isk_enabled",  True))
+        self._msn_enabled  = self.char_cfg.get("msn_enabled",  self.cfg.get("msn_enabled",  True))
+        self._anom_enabled = self.char_cfg.get("anom_enabled", self.cfg.get("anom_enabled", False))
 
         # Enforce mutual exclusivity: if both ON, keep MSN, disable ANOM
         if self._msn_enabled and self._anom_enabled:
             self._anom_enabled = False
-            self.cfg["anom_enabled"] = False
-        self._dps_enabled  = self.cfg.get("dps_enabled", True)
+            self.char_cfg["anom_enabled"] = False
 
-        # Section collapsed states
-        self._isk_collapsed   = self.cfg.get("isk_collapsed",   False)
-        self._msn_collapsed   = self.cfg.get("msn_collapsed",   False)
-        self._anom_collapsed  = self.cfg.get("anom_collapsed",  False)
-        self._dps_collapsed   = self.cfg.get("dps_collapsed",   False)
-        self._alert_collapsed = self.cfg.get("alert_collapsed", False)
-        self._brk_collapsed = self.cfg.get("brk_collapsed", False)
+        # Section collapsed states (per character, legacy-global fallback)
+        self._isk_collapsed   = self.char_cfg.get("isk_collapsed",   self.cfg.get("isk_collapsed",   False))
+        self._msn_collapsed   = self.char_cfg.get("msn_collapsed",   self.cfg.get("msn_collapsed",   False))
+        self._anom_collapsed  = self.char_cfg.get("anom_collapsed",  self.cfg.get("anom_collapsed",  False))
+        self._alert_collapsed = self.char_cfg.get("alert_collapsed", self.cfg.get("alert_collapsed", False))
+        self._brk_collapsed   = self.char_cfg.get("brk_collapsed",   self.cfg.get("brk_collapsed",   False))
 
         self._current_theme = self.char_cfg.get("theme", THEME_DEFAULT)
         apply_theme_colors(self._current_theme)
@@ -1243,8 +1659,6 @@ class CharacterWindow:
 
         if self.char_cfg.get("isk_detached", False):
             self._detach("isk")
-        if self.char_cfg.get("dps_detached", False):
-            self._detach("dps")
         if self.char_cfg.get("msn_detached", False):
             self._detach("msn")
         if self.char_cfg.get("anom_detached", False):
@@ -1266,42 +1680,66 @@ class CharacterWindow:
 
     # Sauvegarde le cache nom→type_id sur le disque
     def _save_nameid_cache(self):
-        try:
-            with open(NAMEID_CACHE, "w", encoding="utf-8") as f:
-                json.dump(self._name_to_id_cache, f, ensure_ascii=False)
-        except Exception:
-            pass
+        # Multiple loot threads (and multiple CharacterWindows) share one file.
+        # Merge under a lock so concurrent writers don't clobber each other's IDs,
+        # then write atomically so a reader never sees a half-written file.
+        with _NAMEID_LOCK:
+            merged = {}
+            if os.path.exists(NAMEID_CACHE):
+                try:
+                    with open(NAMEID_CACHE, "r", encoding="utf-8") as f:
+                        merged = json.load(f)
+                except Exception:
+                    merged = {}
+            merged.update(self._name_to_id_cache)
+            self._name_to_id_cache = merged   # adopt IDs other windows resolved
+            try:
+                tmp = NAMEID_CACHE + ".tmp"
+                with open(tmp, "w", encoding="utf-8") as f:
+                    json.dump(merged, f, ensure_ascii=False)
+                os.replace(tmp, NAMEID_CACHE)
+            except Exception:
+                pass
 
     # ── Market data download (24h cache) ─────────────────────────────
     # Télécharge les prix ESI (cache 24h sur disque)
     def _download_market_data(self):
+        # Serialize across all CharacterWindows: only one thread fetches ESI and
+        # writes the shared cache; the others block, then load the file it wrote.
+        # This removes both the redundant N× downloads and the concurrent-write
+        # race that could corrupt ratting_prices.json.
+        with _PRICE_LOCK:
+            # Use disk cache if less than 24h old
+            if os.path.exists(PRICE_CACHE):
+                try:
+                    age_hrs = (time.time() - os.path.getmtime(PRICE_CACHE)) / 3600
+                    if age_hrs < 24:
+                        with open(PRICE_CACHE, "r", encoding="utf-8") as f:
+                            self._global_prices = json.load(f)
+                        return
+                except Exception:
+                    pass
 
-        # Use disk cache if less than 24h old
-        if os.path.exists(PRICE_CACHE):
+            # Download fresh from ESI
             try:
-                age_hrs = (time.time() - os.path.getmtime(PRICE_CACHE)) / 3600
-                if age_hrs < 24:
-                    with open(PRICE_CACHE, "r", encoding="utf-8") as f:
-                        self._global_prices = json.load(f)
-                    return
+                req = urllib.request.Request(
+                    "https://esi.evetech.net/latest/markets/prices/?datasource=tranquility",
+                    headers={"User-Agent": _ESI_UA})
+                with urllib.request.urlopen(req, timeout=15) as response:
+                    data = json.loads(response.read().decode())
+                    self._global_prices = {
+                        str(item['type_id']): item.get('average_price', item.get('adjusted_price', 0))
+                        for item in data
+                    }
+
+                # Write atomically (temp file + os.replace) so a concurrent or
+                # next-launch reader never sees a half-written cache file.
+                tmp = PRICE_CACHE + ".tmp"
+                with open(tmp, "w", encoding="utf-8") as f:
+                    json.dump(self._global_prices, f)
+                os.replace(tmp, PRICE_CACHE)
             except Exception:
                 pass
-
-        # Download fresh from ESI
-        try:
-            req = urllib.request.Request("https://esi.evetech.net/latest/markets/prices/?datasource=tranquility")
-            with urllib.request.urlopen(req, timeout=15) as response:
-                data = json.loads(response.read().decode())
-                self._global_prices = {
-                    str(item['type_id']): item.get('average_price', item.get('adjusted_price', 0))
-                    for item in data
-                }
-
-            # Save to disk
-            with open(PRICE_CACHE, "w", encoding="utf-8") as f:
-                json.dump(self._global_prices, f)
-        except Exception:
-            pass
 
     # ── Loot clipboard parsing ───────────────────────────────────────
     # Vérifie si le presse-papiers contient un inventaire EVE à parser
@@ -1316,7 +1754,14 @@ class CharacterWindow:
             tracker = self._main_ui if self._main_ui else self
             if content == tracker._last_clipboard:
                 return
+            # One loot lookup at a time per window: if one is already running,
+            # leave _last_clipboard untouched so this paste is retried on a later
+            # poll once the in-flight lookup finishes (no concurrent threads,
+            # no spinner-state interleave).
+            if self._loot_inflight:
+                return
             tracker._last_clipboard = content
+            self._loot_inflight = True
             self._loot_anim_start()
             threading.Thread(target=self._process_loot_copy, args=(content,), daemon=True).start()
         except Exception:
@@ -1336,9 +1781,10 @@ class CharacterWindow:
                 if not name: continue
                 qty = 1
                 if len(parts) >= 2:
-                    try: qty = int(parts[1].replace(',', '').replace('.', '').strip())
-                    except:
-                        qty = 1
+                    # Reuse pnum(): it strips spaces/commas/dots so locale
+                    # thousands separators ("1 000", "1,000", "1.000") all
+                    # parse correctly. Blank/non-numeric → 0 → fall back to 1.
+                    qty = pnum(parts[1]) or 1
                 
                 parsed_items.append({"name": name, "qty": qty})
                 if name not in self._name_to_id_cache:
@@ -1352,7 +1798,8 @@ class CharacterWindow:
                 try:
                     data = json.dumps(chunk).encode('utf-8')
                     req = urllib.request.Request("https://esi.evetech.net/latest/universe/ids/", data=data, 
-                                                 headers={'Content-Type': 'application/json', 'Accept-Language': 'en'})
+                                                 headers={'Content-Type': 'application/json', 'Accept-Language': 'en',
+                                                          'User-Agent': _ESI_UA})
                     with urllib.request.urlopen(req, timeout=5) as response:
                         res = json.loads(response.read().decode())
                         for item in res.get('inventory_types', []):
@@ -1381,14 +1828,36 @@ class CharacterWindow:
             total_session_loot += (price * qty)
         
         now_str = datetime.now().strftime("%H:%M:%S")
-        if total_session_loot > 0:
-            self.root.after(0, lambda amt=total_session_loot, ts=now_str: self._apply_loot(amt, ts))
-        else:
-            # Nothing valued — stop spinner without flashing green
-            self.root.after(0, lambda: self._loot_anim_stop(False))
+        # Marshal the result back to the main thread. Guard against the window
+        # being closed mid-lookup (self.root destroyed → after() would raise
+        # TclError in this daemon thread).
+        try:
+            if total_session_loot > 0:
+                self.root.after(0, lambda amt=total_session_loot, ts=now_str: self._apply_loot(amt, ts))
+            else:
+                # Nothing valued — stop spinner without flashing green
+                self.root.after(0, lambda: self._loot_anim_stop(False))
+        except Exception:
+            pass
+
+    # Bip d'alerte EWAR — Windows uniquement, joué hors du thread UI (non bloquant).
+    def _ewar_sound(self):
+        if not _SND_OK:
+            return
+        def _beep():
+            try:
+                winsound.Beep(1200, 130)
+                winsound.Beep(1650, 160)
+            except Exception:
+                pass
+        try:
+            threading.Thread(target=_beep, daemon=True).start()
+        except Exception:
+            pass
 
     # Pulse visuel sur le cadre d'alerte (pour les événements EWAR)
     def _flash_alert(self):
+        self._ewar_sound()
 
         # Quick pulse flash on the alert frame for EWAR
         def _pulse(step=0):
@@ -1404,7 +1873,10 @@ class CharacterWindow:
                             c.config(bg=bg)
                 except Exception:
                     pass
-                self.root.after(150, lambda: _pulse(step + 1))
+                try:
+                    self.root.after(150, lambda: _pulse(step + 1))
+                except Exception:
+                    pass   # root torn down mid-flash — stop the pulse chain
             else:
 
                 # Reset to normal
@@ -1437,7 +1909,7 @@ class CharacterWindow:
         try:
             time.sleep(0.5)  # Throttle: max ~2 requests/sec to ESI
             url = f"https://esi.evetech.net/latest/markets/10000002/orders/?datasource=tranquility&order_type=sell&type_id={type_id}"
-            req = urllib.request.Request(url)
+            req = urllib.request.Request(url, headers={"User-Agent": _ESI_UA})
             with urllib.request.urlopen(req, timeout=5) as response:
                 orders = json.loads(response.read().decode())
                 if orders:
@@ -1499,6 +1971,7 @@ class CharacterWindow:
     def _loot_anim_stop(self, found):
         """Stop the spinner.  If found=True, flash bright green then restore."""
         self._loot_loading = False
+        self._loot_inflight = False   # release the guard so the next paste can process
         if self._loot_anim_job:
             self.root.after_cancel(self._loot_anim_job)
             self._loot_anim_job = None
@@ -1523,7 +1996,11 @@ class CharacterWindow:
     def _fit(self):
         self.root.update_idletasks()
         self.root.update_idletasks()  # second pass needed on Linux/X11 for nested frame heights
+        # +32 header. Also add the bottom status bar's height, otherwise the
+        # resize grip gets clipped off the bottom edge of the window.
         h = self._body.winfo_reqheight() + 32
+        if getattr(self, "_grip_bar", None) is not None:
+            h += 16   # status bar / resize grip
 
         saved = self.char_cfg.get("geometry", "")
         if saved:
@@ -1581,7 +2058,7 @@ class CharacterWindow:
             self._main_frame.pack(fill="x", padx=3, pady=(0, 3))
             if hasattr(self, "_grip_bar"):
                 self._grip_bar.pack_forget()
-                self._grip_bar.pack(fill="x")
+                self._grip_bar.pack(fill="x", side="bottom")
             if self._full_height > 0:
                 w = self.root.winfo_width()
                 x, y = self.root.winfo_x(), self.root.winfo_y()
@@ -1751,29 +2228,22 @@ class CharacterWindow:
         self._anom_container.grid(row=7, column=0, sticky="ew")
         self._build_anomalies(self._anom_container)
 
-        self._sep_anom_dps = tk.Frame(self._body, bg=BD, height=1)
-        self._sep_anom_dps.grid(row=8, column=0, sticky="ew", padx=4)
+        # DPS MONITOR section removed — DPS now lives in the standalone overlay.
+        # The bottom of the dashboard is a minimal status bar: just the resize grip.
 
-        self._dps_container = tk.Frame(self._body, bg=BG)
-        self._dps_container.grid(row=9, column=0, sticky="ew")
-        self._build_dps(self._dps_container, detached=False)
-
-        # Resize grip at bottom-right
-        self._grip_bar = tk.Frame(self.root, bg=BG, height=14)
-        self._grip_bar.pack(fill="x")
+        # ── Status bar (bottom): a slim visible bar with a decorative grip. ──
+        # Panel-coloured so it reads as a bar against the darker content area.
+        # The character window auto-fits its content and is NOT user-resizable;
+        # the grip glyph is kept purely for visual consistency with the Overview
+        # (no drag-to-resize bindings, and no resize cursor).
+        self._grip_bar = tk.Frame(self.root, bg=BG_P, height=16)
+        self._grip_bar.pack(fill="x", side="bottom")
         self._grip_bar.pack_propagate(False)
         grip_bar = self._grip_bar
-        grip_f = tk.Frame(grip_bar, bg=BDG, width=14, height=14, cursor="bottom_right_corner")
-        grip_f.pack(side="right", padx=1, pady=1)
-        grip_f.pack_propagate(False)
-        grip_l = tk.Label(grip_f, text="⤡",
-                          font=tkfont.Font(family="Consolas", size=9),
-                          bg=BDG, fg=T1, cursor="bottom_right_corner")
-        grip_l.pack(expand=True)
-        for _gw in (grip_f, grip_l):
-            _gw.bind("<Button-1>",        self._resize_start)
-            _gw.bind("<B1-Motion>",       self._resize_drag)
-            _gw.bind("<ButtonRelease-1>", self._resize_end)
+        grip_l = tk.Label(grip_bar, text="⤡",
+                          font=tkfont.Font(family="Consolas", size=10, weight="bold"),
+                          bg=BG_P, fg=T1)
+        grip_l.pack(side="right", padx=4)
 
     # Construit la barre de contrôle (Play/Pause/Stop/Reset + combobox de personnage)
     def _build_controls(self, parent):
@@ -2061,7 +2531,7 @@ class CharacterWindow:
     # Bascule l'affichage du sous-panneau breakdown ISK
     def _toggle_breakdown(self):
         self._brk_collapsed = not self._brk_collapsed
-        self.cfg["brk_collapsed"] = self._brk_collapsed
+        self.char_cfg["brk_collapsed"] = self._brk_collapsed
         save_config(self.cfg)
         if self._brk_collapsed:
             self._brk_tog_btn.config(text="\u25B6")
@@ -2261,143 +2731,6 @@ class CharacterWindow:
                                       "best_isk": self._anom_best_isk_lbl}
             self._anom_wrap.bind("<Configure>", self._on_anom_detached_resize)
 
-    # Construit la section DPS Monitor (inline ou détaché avec barres visuelles)
-    def _build_dps(self, parent, detached=False):
-        F8  = tkfont.Font(family="Consolas", size=8)
-        F7B = tkfont.Font(family="Consolas", size=7, weight="bold")
-        F8B = tkfont.Font(family="Consolas", size=8, weight="bold")
-        F16 = tkfont.Font(family="Consolas", size=16, weight="bold")
-        pad = dict(padx=6, pady=2)
-
-        # ── Header: [accent] [DPS MONITOR] [ON/OFF] ... [▼/▶] [↱] ──
-        # Skip header when detached — DetachedWindow provides its own
-        if not detached:
-            hdr_f = tk.Frame(parent, bg=BG_P, height=20)
-            hdr_f.pack(fill="x")
-            hdr_f.pack_propagate(False)
-            tk.Frame(hdr_f, bg=CD, width=3).pack(side="left", fill="y")
-            tk.Label(hdr_f, text="  DPS MONITOR", font=F8B, bg=BG_P, fg=CD).pack(side="left")
-
-            # ON/OFF button
-            self._dps_on_btn = tk.Label(hdr_f, text="ON" if self._dps_enabled else "OFF",
-                                         font=F7B, bg=BG_P, fg=CA if self._dps_enabled else CS, cursor="hand2", padx=4)
-            self._dps_on_btn.pack(side="left", padx=(4, 0))
-            self._dps_on_btn.bind("<Button-1>", lambda e: self._toggle_enabled("dps"))
-
-            # Detach button (rightmost)
-            self._dps_det_btn = tk.Label(hdr_f, text=" \u21F1 ", font=tkfont.Font(family="Consolas", size=10, weight="bold"),
-                                          bg=BG_P, fg=C_DETACH, cursor="hand2")
-            self._dps_det_btn.pack(side="right", padx=2)
-            self._dps_det_btn.bind("<Button-1>", lambda e: self._detach("dps"))
-            self._dps_det_btn.bind("<Enter>", lambda e: self._dps_det_btn.config(bg=BDG))
-            self._dps_det_btn.bind("<Leave>", lambda e: self._dps_det_btn.config(bg=BG_P))
-            Tooltip(self._dps_det_btn, "Detach")
-
-            # Collapse toggle
-            self._dps_tog_btn = tk.Label(hdr_f, text="\u25BC" if not self._dps_collapsed else "\u25B6",
-                                          font=tkfont.Font(family="Consolas", size=8), bg=BG_P, fg=TD, cursor="hand2")
-            self._dps_tog_btn.pack(side="right", padx=4)
-            self._dps_tog_btn.bind("<Button-1>", lambda e: self._toggle_collapse("dps"))
-            self._dps_tog_btn.bind("<Enter>", lambda e: self._dps_tog_btn.config(fg=TB))
-            self._dps_tog_btn.bind("<Leave>", lambda e: self._dps_tog_btn.config(fg=TD))
-
-            if not self._dps_enabled:
-                self._dps_det_btn.pack_forget()
-                self._dps_tog_btn.pack_forget()
-
-        # ── Content wrapper ──
-        self._dps_wrap = tk.Frame(parent, bg=BG_P)
-        show_content = self._dps_enabled and (detached or not self._dps_collapsed)
-        if detached:
-            if show_content:
-                self._dps_wrap.pack(fill="both", expand=True, **pad)
-        else:
-            if show_content:
-                self._dps_wrap.pack(fill="x", **pad)
-
-        if detached:
-            # ═══════════════════════════════════════════════════════════════
-            # DETACHED MODE: Enhanced layout with bar indicators
-            # ═══════════════════════════════════════════════════════════════
-            
-            # DPS OUT section (top half)
-            out_frame = tk.Frame(self._dps_wrap, bg=BG_P, width=1)
-            out_frame.pack(fill="both", expand=True, pady=(0, 2))
-            out_frame.pack_propagate(False)
-            
-            # Title row
-            out_hdr = tk.Frame(out_frame, bg=BG_P)
-            out_hdr.pack(fill="x")
-            lbl_out_title = tk.Label(out_hdr, text="▸ DPS OUT", font=F8B, bg=BG_P, fg=CD, anchor="w")
-            lbl_out_title.pack(side="left")
-            
-            # Value with bar background
-            out_bar_frame = tk.Frame(out_frame, bg=BG, highlightbackground=BD, highlightthickness=1, width=1)
-            out_bar_frame.pack(fill="both", expand=True, pady=2)
-            out_bar_frame.pack_propagate(False)
-            
-            # The bar canvas — no fixed height so it shrinks freely
-            out_canvas = tk.Canvas(out_bar_frame, bg=BG, highlightthickness=0)
-            out_canvas.pack(fill="both", expand=True)
-            
-            # Value label overlaid on canvas
-            dps_out = tk.Label(out_bar_frame, text="0", font=F16, bg=BG, fg=CD, anchor="center")
-            dps_out.place(relx=0.02, rely=0.5, anchor="w")
-            
-            # DPS IN section (bottom half)
-            in_frame = tk.Frame(self._dps_wrap, bg=BG_P, width=1)
-            in_frame.pack(fill="both", expand=True, pady=(2, 0))
-            in_frame.pack_propagate(False)
-            
-            # Title row
-            in_hdr = tk.Frame(in_frame, bg=BG_P)
-            in_hdr.pack(fill="x")
-            lbl_in_title = tk.Label(in_hdr, text="◂ DPS IN", font=F8B, bg=BG_P, fg=CR, anchor="w")
-            lbl_in_title.pack(side="left")
-            
-            # Value with bar background
-            in_bar_frame = tk.Frame(in_frame, bg=BG, highlightbackground=BD, highlightthickness=1, width=1)
-            in_bar_frame.pack(fill="both", expand=True, pady=2)
-            in_bar_frame.pack_propagate(False)
-            
-            # The bar canvas
-            in_canvas = tk.Canvas(in_bar_frame, bg=BG, highlightthickness=0)
-            in_canvas.pack(fill="both", expand=True)
-            
-            # Value label overlaid on canvas
-            dps_in = tk.Label(in_bar_frame, text="0", font=F16, bg=BG, fg=CR, anchor="center")
-            dps_in.place(relx=0.02, rely=0.5, anchor="w")
-            
-            labels = {
-                "dps_out": dps_out, "dps_in": dps_in,
-                "lbl_out_title": lbl_out_title, "lbl_in_title": lbl_in_title,
-                "out_canvas": out_canvas, "in_canvas": in_canvas,
-                "out_bar_frame": out_bar_frame, "in_bar_frame": in_bar_frame,
-                "_last_scale_h": 0, "_max_dps_out": 1000, "_max_dps_in": 500
-            }
-            self._dps_det_labels = labels
-            
-            # Bind resize handler for dynamic scaling
-            self._dps_wrap.bind("<Configure>", self._on_dps_detached_resize)
-        else:
-            # ═══════════════════════════════════════════════════════════════
-            # INLINE MODE: Simple side-by-side layout (unchanged)
-            # ═══════════════════════════════════════════════════════════════
-            dl = tk.Frame(self._dps_wrap, bg=BG_P)
-            dl.pack(side="left", expand=True, fill="both")
-            tk.Label(dl, text="DPS OUT", font=F8, bg=BG_P, fg=TD, anchor="w").pack(anchor="w", fill="x")
-            dps_out = tk.Label(dl, text="0", font=F16, bg=BG_P, fg=CD, anchor="w")
-            dps_out.pack(anchor="w")
-
-            dr_f = tk.Frame(self._dps_wrap, bg=BG_P)
-            dr_f.pack(side="right", expand=True, fill="both")
-            tk.Label(dr_f, text="DPS IN", font=F8, bg=BG_P, fg=TD, anchor="e").pack(anchor="e", fill="x")
-            dps_in = tk.Label(dr_f, text="0", font=F16, bg=BG_P, fg=CR, anchor="e")
-            dps_in.pack(anchor="e")
-
-            self.dps_out = dps_out
-            self.dps_in = dps_in
-
     # Adapte la police de la section anomalie quand la fenêtre détachée est redimensionnée
     def _on_anom_detached_resize(self, event):
         if not self._anom_detached or not self._anom_det_labels:
@@ -2414,7 +2747,11 @@ class CharacterWindow:
         try:
             scale    = max(0.8, min(3.0, h / 100))
             val_size = max(9, min(36, int(10 * scale)))
-            val_font = tkfont.Font(family="Consolas", size=val_size, weight="bold")
+            val_font = getattr(self, "_anom_det_val_font", None)
+            if val_font is None:
+                self._anom_det_val_font = val_font = tkfont.Font(family="Consolas", size=val_size, weight="bold")
+            else:
+                val_font.configure(size=val_size)
             labels = self._anom_det_labels
             for key in ("cur", "cleared", "avg_time", "avg_isk", "best_isk"):
                 if labels.get(key):
@@ -2447,97 +2784,25 @@ class CharacterWindow:
             self._isk_font_calc.configure(size=max(10, val_size - 4))
             labels = self._isk_det_labels
             if labels.get("sl"):
-                labels["sl"].config(font=tkfont.Font(family="Consolas", size=sess_size, weight="bold"))
+                sess_font = getattr(self, "_isk_det_sess_font", None)
+                if sess_font is None:
+                    self._isk_det_sess_font = sess_font = tkfont.Font(family="Consolas", size=sess_size, weight="bold")
+                else:
+                    sess_font.configure(size=sess_size)
+                labels["sl"].config(font=sess_font)
         finally:
             self._scaling_isk = False
 
-    # Adapte les polices et barres DPS quand la fenêtre détachée est redimensionnée
-    def _on_dps_detached_resize(self, event):
-        if not self._dps_detached or not self._dps_det_labels:
-            return
-        # Guard: font changes trigger another <Configure>, causing an oscillation loop
-        if getattr(self, '_scaling_dps', False):
-            return
-        labels = self._dps_det_labels
-        h = event.height
+    # ── Graphique d'historique DPS ────────────────────────────────────
 
-        last_h = labels.get("_last_scale_h", 0)
-        if abs(h - last_h) < 5:
-            return
-        labels["_last_scale_h"] = h
-
-        self._scaling_dps = True
-        try:
-            base_h = 100
-            value_base = 18
-            title_base = 9
-
-            scale      = max(0.8, min(4.0, h / base_h))
-            value_size = max(14, min(72, int(value_base * scale)))
-            title_size = max(8,  min(18, int(title_base * scale * 0.8)))
-
-            value_font = tkfont.Font(family="Consolas", size=value_size, weight="bold")
-            title_font = tkfont.Font(family="Consolas", size=title_size, weight="bold")
-
-            labels["dps_out"].config(font=value_font)
-            labels["dps_in"].config(font=value_font)
-            if "lbl_out_title" in labels:
-                labels["lbl_out_title"].config(font=title_font)
-            if "lbl_in_title" in labels:
-                labels["lbl_in_title"].config(font=title_font)
-
-            self._update_dps_bars()
-        finally:
-            self._scaling_dps = False
-
-    # Met à jour les barres visuelles DPS en mode détaché
-    def _update_dps_bars(self):
-        if not self._dps_detached or not self._dps_det_labels:
-            return
-        
-        labels = self._dps_det_labels
-        out_canvas = labels.get("out_canvas")
-        in_canvas = labels.get("in_canvas")
-        
-        if not out_canvas or not in_canvas:
-            return
-        
-        # Get current DPS values
-        dps_out_val = self.data.dps(True)
-        dps_in_val = self.data.dps(False)
-        
-        # Update max trackers (auto-scale)
-        max_out = labels.get("_max_dps_out", 1000)
-        max_in = labels.get("_max_dps_in", 500)
-        if dps_out_val > max_out:
-            labels["_max_dps_out"] = dps_out_val * 1.2
-            max_out = labels["_max_dps_out"]
-        if dps_in_val > max_in:
-            labels["_max_dps_in"] = dps_in_val * 1.2
-            max_in = labels["_max_dps_in"]
-        
-        # Calculate bar fill percentages
-        out_pct = min(1.0, dps_out_val / max_out) if max_out > 0 else 0
-        in_pct = min(1.0, dps_in_val / max_in) if max_in > 0 else 0
-        
-        # Update OUT canvas
-        out_canvas.delete("bar")
-        w = out_canvas.winfo_width()
-        h = out_canvas.winfo_height()
-        if w > 1 and h > 1:
-            bar_w = int(w * out_pct)
-            # Subtle gradient effect using dimmed accent color
-            bar_color = _dim(CD, 0.3)
-            out_canvas.create_rectangle(0, 0, bar_w, h, fill=bar_color, outline="", tags="bar")
-        
-        # Update IN canvas
-        in_canvas.delete("bar")
-        w = in_canvas.winfo_width()
-        h = in_canvas.winfo_height()
-        if w > 1 and h > 1:
-            bar_w = int(w * in_pct)
-            bar_color = _dim(CR, 0.3)
-            in_canvas.create_rectangle(0, 0, bar_w, h, fill=bar_color, outline="", tags="bar")
+    # Ajoute les valeurs DPS courantes au deque d'historique (appelé à chaque tick)
+    def _sample_dps_history(self, dps_out=None, dps_in=None):
+        # _tick already computed both values this frame — accept them to avoid
+        # two redundant dps() recomputations per tick.
+        d = self.data
+        if dps_out is None: dps_out = d.dps(True)
+        if dps_in is None:  dps_in  = d.dps(False)
+        d.dps_hist.append((time.monotonic(), dps_out, dps_in))
 
     # ── Section toggle helpers ───────────────────────────────────────
     # Active/désactive une section (avec exclusivité mutuelle MSN/ANOM)
@@ -2552,7 +2817,7 @@ class CharacterWindow:
                 self._force_disable(other)
 
         setattr(self, attr, enabled)
-        self.cfg[f"{section}_enabled"] = enabled
+        self.char_cfg[f"{section}_enabled"] = enabled
         save_config(self.cfg)
 
         # If turning OFF while detached, reattach first
@@ -2593,7 +2858,7 @@ class CharacterWindow:
 
         # Force-disable a section (for mutual exclusivity)
         setattr(self, f"_{section}_enabled", False)
-        self.cfg[f"{section}_enabled"] = False
+        self.char_cfg[f"{section}_enabled"] = False
 
         self._force_detach_off(section)
 
@@ -2641,12 +2906,11 @@ class CharacterWindow:
 
     # Retourne le nom de la méthode de construction pour une section
     def _section_build_name(self, section):
-        names = {"isk": "isk", "msn": "missions", "anom": "anomalies", "dps": "dps"}
+        names = {"isk": "isk", "msn": "missions", "anom": "anomalies"}
         return names.get(section, section)
 
     # Retourne le padding approprié pour une section
     def _get_section_pad(self, section):
-        if section == "dps": return dict(padx=6, pady=2)
         return dict(padx=6, pady=(2, 4))
 
     # Collapse/déplie une section de l'interface
@@ -2654,7 +2918,7 @@ class CharacterWindow:
         attr = f"_{section}_collapsed"
         collapsed = not getattr(self, attr)
         setattr(self, attr, collapsed)
-        self.cfg[f"{section}_collapsed"] = collapsed
+        self.char_cfg[f"{section}_collapsed"] = collapsed
         save_config(self.cfg)
 
         tog = getattr(self, f"_{section}_tog_btn", None)
@@ -2750,28 +3014,6 @@ class CharacterWindow:
                 self.ll.config(text=f"{fiskf(d.loot_val)} ISK")
             self.tnl.config(text=f"{fiskf(d.bg*(1-d.tax) + d.loot_val)} ISK")
 
-    # Met à jour les labels DPS out/in (live ou frozen)
-    def _update_dps_labels(self, labels, frozen=None):
-        if not labels: return
-        if frozen:
-            if labels.get("dps_out"):
-                labels["dps_out"].config(text=frozen["dps_out"])
-            if labels.get("dps_in"):
-                labels["dps_in"].config(text=frozen["dps_in"])
-            return
-
-        # live path (dirty flags already handled in _tick for main window)
-        dd = self.data.dps(True)
-        dr = self.data.dps(False)
-        if labels.get("dps_out"):
-            labels["dps_out"].config(text=f"{dd:,.0f}")
-        if labels.get("dps_in"):
-            labels["dps_in"].config(text=f"{dr:,.0f}")
-        
-        # Update visual bars if this is the detached window
-        if labels is self._dps_det_labels and self._dps_detached:
-            self._update_dps_bars()
-
     # Met à jour les labels de mission (nom, objectif, compteurs)
     def _update_mission_labels(self, frozen=None):
         if frozen:
@@ -2807,7 +3049,9 @@ class CharacterWindow:
             
             # Use dynamic font size if detached, otherwise default 9pt
             font_size = getattr(self, '_alert_det_font_size', 9) if self._alert_detached else 9
-            F_alert = tkfont.Font(family="Consolas", size=font_size)
+            F_alert = self._alert_font_cache.get(font_size)
+            if F_alert is None:
+                F_alert = self._alert_font_cache[font_size] = tkfont.Font(family="Consolas", size=font_size)
             
             for w in self._alert_frame.winfo_children():
                 w.destroy()
@@ -2905,11 +3149,10 @@ class CharacterWindow:
         self._save_pos()
         self.char_cfg["main_minimized"] = self._main_hidden
         self.char_cfg["isk_detached"]   = self._isk_detached
-        self.char_cfg["dps_detached"]   = self._dps_detached
         self.char_cfg["msn_detached"]   = self._msn_detached
         self.char_cfg["anom_detached"]  = self._anom_detached
         self.char_cfg["alert_detached"] = self._alert_detached
-        for key, attr in [("isk", "_isk_window"), ("dps", "_dps_window"),
+        for key, attr in [("isk", "_isk_window"),
                            ("msn", "_msn_window"), ("anom", "_anom_window"),
                            ("alert", "_alert_window")]:
             try:
@@ -2923,6 +3166,13 @@ class CharacterWindow:
         if self.fh:
             self.fh.close()
         self._close_chatlog()
+        # Cancel pending after() loops so they don't fire on destroyed widgets
+        for _job in ("_poll_job", "_tick_job", "_loot_anim_job"):
+            jid = getattr(self, _job, None)
+            if jid:
+                try: self.root.after_cancel(jid)
+                except Exception: pass
+                setattr(self, _job, None)
         self.root.destroy()   # destroys this Toplevel; MainUI root stays alive
 
     # ── Parse a combat log line ──────────────────────────────────────
@@ -2959,10 +3209,7 @@ class CharacterWindow:
         if (m := RE_BT.search(raw)):
             a = pnum(m.group(1))
             d.bg += a
-            d.bp += a
             d.bc += 1
-            if not d.fb:
-                d.fb = ts
             self._anom_combat_event(ts)
             self._anom_add_bounty(ts, a)
             return
@@ -2973,7 +3220,6 @@ class CharacterWindow:
             return
 
         if RE_NM.search(raw):
-            d.mr += 1
             self._anom_combat_event(ts)
             return
 
@@ -2994,7 +3240,7 @@ class CharacterWindow:
                 d.alerts.append((now_str, "STORY", "\u2605 STORYLINE MISSION IMMINENT"))
                 self._storyline_ctr = 0
             d.alerts.append((now_str, "MSN", f"Mission #{m.group(1)} complete ({self._storyline_ctr}/16)"))
-            self.cfg["storyline_counter"] = self._storyline_ctr
+            self.char_cfg["storyline_counter"] = self._storyline_ctr
             save_config(self.cfg)
             return
 
@@ -3002,7 +3248,6 @@ class CharacterWindow:
         if m:
             faction = m.group(1).strip()
             amt = m.group(2)
-            d.standings.append((faction, amt))
             d.alerts.append((now_str, "STAND", f"+{amt} standing with {faction}"))
             return
 
@@ -3032,33 +3277,43 @@ class CharacterWindow:
             return
 
     # ── Polling loop (reads new log data) ────────────────────────────
-    # Boucle de lecture des logs et chatlog (s'exécute toutes les poll_ms ms)
-    def _poll(self):
+    # Lit une fois les nouveaux logs (gamelog + rotation + chatlog).
+    # Appelé par le timer _poll ET par le watchdog (sur événement fichier).
+    def _read_logs_once(self):
+        if getattr(self, "_suspended", False) or self._st != "running":
+            return
         try:
-            if getattr(self, "_suspended", False):
-                # Character hidden by overview — skip log reading entirely
-                self._poll_job = self.root.after(self.poll_ms, self._poll)
-                return
-            if self._st == "running":
-                self._read()
-                latest_chat = self._find_latest_chatlog()
-                if latest_chat and latest_chat != self._chat_file:
-                    self._open_chatlog()
-                self._read_chatlog()
-                self._check_clipboard()
-
-            elif self._st == "paused":
-                self._check_clipboard()
-
+            self._read()
+            self._check_gamelog_rotation()
+            latest_chat = self._find_latest_chatlog()
+            if latest_chat and latest_chat != self._chat_file:
+                self._open_chatlog()
+            self._read_chatlog()
         except Exception:
             pass
 
-        self.root.after(self.poll_ms, self._poll)
+    # Boucle de lecture des logs. Quand le watchdog est actif ce timer n'est
+    # plus qu'un filet de sécurité lent (2 s) ; sinon c'est le lecteur principal
+    # à poll_ms. La lecture du presse-papiers vit dans _tick pour rester réactive.
+    def _poll(self):
+        try:
+            self._read_logs_once()
+        except Exception:
+            pass
+        interval = self.poll_ms
+        mu = self._main_ui
+        if mu is not None and getattr(mu, "_log_observer", None) is not None:
+            interval = max(self.poll_ms, 2000)
+        self._poll_job = self.root.after(interval, self._poll)
 
     # ── UI tick loop (updates labels) ────────────────────────────────
     # Boucle de mise à jour de l'UI (s'exécute toutes les poll_ms ms)
     def _tick(self):
         self._last_tick_wall = time.monotonic()
+        # Clipboard/loot polling lives here (not _poll) so it stays responsive
+        # even when the watchdog observer slows the _poll fallback interval.
+        if not getattr(self, "_suspended", False):
+            self._check_clipboard()
         d = self.data
         try: d.tax = max(0, min(float(self.tax_var.get()) / 100, 1))
         except Exception:
@@ -3071,13 +3326,9 @@ class CharacterWindow:
             self._update_mission_labels(frozen=self._frozen)
             self._update_alert_labels(frozen=self._frozen)
             self._update_anomaly_labels(frozen=self._frozen)
-            main_dps = {"dps_out": self.dps_out, "dps_in": self.dps_in}
-            self._update_dps_labels(main_dps, frozen=self._frozen)
             if self._isk_detached and self._isk_det_labels:
                 self._update_isk_labels(self._isk_det_labels, frozen=self._frozen)
-            if self._dps_detached and self._dps_det_labels:
-                self._update_dps_labels(self._dps_det_labels, frozen=self._frozen)
-            self.root.after(self.poll_ms, self._tick)
+            self._tick_job = self.root.after(self.poll_ms, self._tick)
             return
 
         # Live dirty-flag updates (main window)
@@ -3095,12 +3346,14 @@ class CharacterWindow:
 
         dd = d.dps(True)
         dr = d.dps(False)
-        if self._last_values.get("dps_out") != dd:
-            self._last_values["dps_out"] = dd
-            self.dps_out.config(text=f"{dd:,.0f}")
-        if self._last_values.get("dps_in") != dr:
-            self._last_values["dps_in"] = dr
-            self.dps_in.config(text=f"{dr:,.0f}")
+        # Track the session PEAK continuously — _stop() alone only captured the
+        # instantaneous DPS at the moment Stop was pressed, missing real spikes.
+        if dd > d.pkd: d.pkd = dd
+        if dr > d.pkr: d.pkr = dr
+
+        # Échantillonne l'historique DPS — consommé par l'overlay DPS autonome
+        if self._st == "running":
+            self._sample_dps_history(dd, dr)
 
         self._update_breakdown_labels()
         self._update_mission_labels()
@@ -3109,14 +3362,11 @@ class CharacterWindow:
             self._anom_check_gap()
         self._update_anomaly_labels()
 
-        # Detached windows
+        # Fenêtres détachées
         if self._isk_detached and self._isk_det_labels:
             self._update_isk_labels(self._isk_det_labels)
-        if self._dps_detached and self._dps_det_labels:
-            self._update_dps_labels(self._dps_det_labels)
 
-        d.trim()
-        self.root.after(self.poll_ms, self._tick)
+        self._tick_job = self.root.after(self.poll_ms, self._tick)
 
     # ── Stop session & freeze display ────────────────────────────────
     # Arrête la session et gèle l'affichage avec les données finales
@@ -3195,37 +3445,18 @@ class CharacterWindow:
         if self.fh:
             self.fh.close()
             self.fh = None
-        self.cf = None
+        self.fp = 0
+        # Keep self.cf (the character's gamelog path) intact so Play (_go) can
+        # restart the same character — closing fh forces _go to re-open from EOF.
         self._close_chatlog()
         self._st = "stopped"
         self._update_buttons()
 
     # Sauvegarde la session et réinitialise pour le prochain site
     def _next_site(self):
-
-        # Save session to history, close current site, reset everything
-        d = self.data
-        char_name = self.char_name
-        try: tax_pct = float(self.tax_var.get())
-        except:
-            tax_pct = DEF_TAX
-        try: d.tax = max(0, min(float(self.tax_var.get()) / 100, 1))
-        except Exception:
-            pass
-        self._anom_close_current()
-        if not self._session_saved:
-            save_session(d, char_name, tax_pct)
-        self._session_saved = False
-        self.data.reset()
-        self._frozen = None
-        self._anom_paused_secs = 0
-        if self.fh:
-            self.fh.close()
-            self.fh = None
-        self.cf = None
-        self._close_chatlog()
-        self._st = "stopped"
-        self._update_buttons()
+        # Identical behaviour to RESET — save the session, then clear all
+        # counters/state. Delegates to _reset so the two can never drift apart.
+        self._reset()
 
     # Ouvre la fenêtre de paramètres (ou la met au premier plan)
     def _settings(self):
@@ -3253,49 +3484,48 @@ class CharacterWindow:
         total_isk = 0
         
         try:
+            # Stream the file line-by-line instead of readlines() so a long
+            # session's multi-MB gamelog isn't fully materialised on the UI thread.
             with open(self.cf, "r", encoding="utf-8", errors="replace") as f:
-                lines = f.readlines()
-            
-            for raw in lines:
-                raw = raw.rstrip("\n\r")
-                if not raw.strip():
-                    continue
-                
-                # Extract timestamp
-                m = RE_TS.search(raw)
-                if not m:
-                    continue
-                try:
-                    ts = datetime.strptime(m.group(1), "%Y.%m.%d %H:%M:%S").replace(tzinfo=timezone.utc)
-                except Exception:
-                    continue
-                
-                # Skip lines older than cutoff
-                if ts < cutoff:
-                    continue
-                
-                # Check for bounty line
-                m = RE_BT.search(raw)
-                if m:
-                    amt = pnum(m.group(1))
-                    self.data.bg += amt
-                    self.data.bp += amt
-                    self.data.bc += 1
-                    bounties_found += 1
-                    total_isk += amt
-                    
-                    # Track earliest bounty timestamp
-                    if earliest_ts is None or ts < earliest_ts:
-                        earliest_ts = ts
-                    
-                    # Set first bounty time if not set
-                    if not self.data.fb:
-                        self.data.fb = ts
-            
-            # Adjust session start time to earliest bounty found
+                for raw in f:
+                    raw = raw.rstrip("\n\r")
+                    if not raw.strip():
+                        continue
+
+                    # Extract timestamp
+                    m = RE_TS.search(raw)
+                    if not m:
+                        continue
+                    try:
+                        ts = datetime.strptime(m.group(1), "%Y.%m.%d %H:%M:%S").replace(tzinfo=timezone.utc)
+                    except Exception:
+                        continue
+
+                    # Skip lines older than cutoff
+                    if ts < cutoff:
+                        continue
+
+                    # Vérifie si la ligne est un paiement de bounty
+                    m = RE_BT.search(raw)
+                    if m:
+                        amt = pnum(m.group(1))
+                        self.data.bg += amt
+                        self.data.bc += 1
+                        # Drive the anomaly (site) state machine too, mirroring the
+                        # live _parse path, so backfilled kills populate site
+                        # count/ISK instead of leaving the anomaly panel at zero.
+                        self._anom_combat_event(ts)
+                        self._anom_add_bounty(ts, amt)
+                        bounties_found += 1
+                        total_isk += amt
+
+                        # Mémorise le timestamp de la bounty la plus ancienne
+                        if earliest_ts is None or ts < earliest_ts:
+                            earliest_ts = ts
+
+            # Ajuste le t0 de la session sur la première bounty retrouvée
             if earliest_ts:
                 self.data.t0 = earliest_ts
-                # Add alert about backfill
                 now_str = datetime.now().strftime("%H:%M:%S")
                 self.data.alerts.append((now_str, "INFO", f"Backfilled {bounties_found} kills ({fiskf(total_isk)} ISK)"))
         
@@ -3312,15 +3542,55 @@ class CharacterWindow:
                 self._parse(l)
         self.fp = self.fh.tell()
 
+    # Détecte un nouveau gamelog pour ce personnage (EVE écrit un nouveau fichier
+    # par session de jeu au relog/undock) et bascule dessus, pour qu'une session
+    # active continue de compter au lieu de lire indéfiniment un fichier périmé.
+    def _check_gamelog_rotation(self):
+        now = time.monotonic()
+        if now - self._last_gamelog_scan < 5:
+            return
+        self._last_gamelog_scan = now
+        if not self.cf:
+            return
+        try:
+            latest = scan_logs(self.log_path).get(self.char_id)
+        except Exception:
+            return
+        if not latest or os.path.normcase(latest) == os.path.normcase(self.cf):
+            return
+        # Ne bascule que vers un fichier strictement plus récent que le courant.
+        try:
+            if os.path.getmtime(latest) <= os.path.getmtime(self.cf):
+                return
+        except Exception:
+            return
+        try:
+            if self.fh:
+                self.fh.close()
+        except Exception:
+            pass
+        try:
+            self.fh = open(latest, "r", encoding="utf-8", errors="replace")
+            self.fp = 0                       # nouveau fichier de session — lire depuis le début
+            self.cf = latest
+            now_str = datetime.now().strftime("%H:%M:%S")
+            self.data.alerts.append((now_str, "INFO", "Switched to new gamelog"))
+        except Exception:
+            self.fh = None
+
     # Retourne le chemin du fichier chatlog le plus récent dans le dossier EVE
     def _find_latest_chatlog(self):
         chat_dir = self.chat_path
         if not os.path.isdir(chat_dir): return None
         best = None
         best_mt = 0
+        # EVE chatlog files are Agent_<date>_<time>_<charid>.txt. Match only THIS
+        # character's logs, otherwise every window tails whichever character's
+        # Agent log is globally newest and misattributes its WEB alerts.
+        suffix = f"_{self.char_id}.txt"
         try:
             for fn in os.listdir(chat_dir):
-                if RE_CHATLOG_FN.match(fn):
+                if RE_CHATLOG_FN.match(fn) and fn.endswith(suffix):
                     fp = os.path.join(chat_dir, fn)
                     mt = os.path.getmtime(fp)
                     if mt > best_mt:
@@ -3372,6 +3642,16 @@ class CharacterWindow:
             npc = shtml(m.group(1).strip())
             d.alerts.append((now_str, "WEB", f"\u26A0 WEBBED by {npc}!"))
             self._flash_alert()
+            return
+
+        # Accepted-mission line names the current mission (drives the mission
+        # tracker + history 'last_mission'; previously RE_MSN_ACCEPT was unused
+        # so mission_name never populated).
+        m = RE_MSN_ACCEPT.search(raw)
+        if m:
+            d.mission_name = m.group(1).strip()
+            d.mission_obj_met = False
+            d.alerts.append((now_str, "MSN", f"Accepted: {d.mission_name[:32]}"))
             return
 
     # Ferme le handle du chatlog et réinitialise les variables associées
@@ -3428,7 +3708,7 @@ class CharacterWindow:
                             highlightbackground=BDG, highlightcolor=BDG)
 
         # Detached windows
-        for attr in ('_isk_window', '_dps_window', '_msn_window',
+        for attr in ('_isk_window', '_msn_window',
                      '_anom_window', '_alert_window'):
             win = getattr(self, attr, None)
             if win:
@@ -3440,6 +3720,18 @@ class CharacterWindow:
                                         highlightcolor=BDG)
                 except Exception:
                     pass
+
+        # DPS overlay (owned by MainUI) — keep its color-keyed background and
+        # re-assert its mode chrome (backdrop / contour / ✕ / grip) after the walk.
+        try:
+            _mu = getattr(self, "_main_ui", None)
+            ov = _mu._overlays.get(self.char_id) if _mu else None
+            if ov and ov.w.winfo_exists():
+                _walk(ov.w)
+                ov.w.configure(bg=OVERLAY_KEY)
+                ov._apply_mode()
+        except Exception:
+            pass
 
         # Settings / History Toplevels (if open)
         for attr in ('_sw', '_hw'):
@@ -3454,100 +3746,6 @@ class CharacterWindow:
         # 6. Refresh ttk combobox style and button states
         self._style()
         self._update_buttons()
-
-    def _rebuild_ui(self):
-
-        # Full UI rebuild with current theme
-        # ── Apply the new theme colors to module globals ──
-        apply_theme_colors(self._current_theme)
-
-        # ── Save volatile state ──
-        saved_st = self._st
-
-        # ── Save current geometry before hiding ──
-        cur_geo = self.root.geometry()
-
-        # ── Hide main window to avoid flicker ──
-        self.root.withdraw()
-
-        # ── Close all popup/detached windows (saving positions) ──
-        for key, attr in [("isk", "_isk_window"), ("dps", "_dps_window"),
-                           ("msn", "_msn_window"), ("anom", "_anom_window"),
-                           ("alert", "_alert_window")]:
-            try:
-                win = getattr(self, attr)
-                if win and win.w.winfo_exists():
-                    win._save_geometry()
-                    win.w.destroy()
-            except Exception:
-                pass
-            setattr(self, attr, None)
-
-        # Remember detached states but reset for rebuild
-        isk_det = self._isk_detached
-        dps_det = self._dps_detached
-        msn_det = self._msn_detached
-        anom_det = self._anom_detached
-        alert_det = self._alert_detached
-        self._isk_detached = False
-        self._dps_detached = False
-        self._msn_detached = False
-        self._anom_detached = False
-        self._alert_detached = False
-        self._isk_det_labels = {}
-        self._dps_det_labels = {}
-        self._msn_det_labels = {}
-        self._anom_det_labels = {}
-
-        if self._sw and self._sw.w.winfo_exists():
-            try: self._sw.w.destroy()
-            except Exception:
-                pass
-            self._sw = None
-        if self._hw and self._hw.w.winfo_exists():
-            try: self._hw.w.destroy()
-            except Exception:
-                pass
-            self._hw = None
-
-        # ── Clear btn_sets (will be repopulated by _build) ──
-        self._btn_sets = []
-
-        # ── Destroy all root children ──
-        for w in self.root.winfo_children():
-            w.destroy()
-
-        # ── Re-apply styles and rebuild ──
-        self._style()
-        self._build()
-
-        self.root.config(highlightbackground=BDG, highlightcolor=BDG, highlightthickness=1)
-        self.root.configure(bg=BG)
-        self.root.attributes("-alpha", self.alpha)
-
-        # ── Restore exact geometry and show ──
-        self.root.geometry(cur_geo)
-        self.root.update_idletasks()
-
-        # ── Re-open detached windows ──
-        if isk_det:
-            self._detach("isk")
-        if dps_det:
-            self._detach("dps")
-        if msn_det:
-            self._detach("msn")
-        if anom_det:
-            self._detach("anom")
-        if alert_det:
-            self._detach("alert")
-
-        # ── Restore button state ──
-        self._update_buttons()
-
-        # ── Show window (smooth reveal) ──
-        self.root.deiconify()
-        self.root.lift()
-        self.root.attributes("-topmost", True)
 
     # Démarre ou reprend la session de ratting pour le personnage sélectionné
     def _go(self):
@@ -3624,12 +3822,6 @@ class CharacterWindow:
             self._sep_isk_msn.grid_remove()
             self._isk_window = DetachedWindow(self.root, self, "ISK TRACKER", CD, "isk", lambda parent, detached: self._build_isk(parent, detached=True), char_name=self.char_name)
             self._fit()
-        elif section == "dps" and not self._dps_detached:
-            self._dps_detached = True
-            self._dps_container.grid_remove()
-            self._sep_anom_dps.grid_remove()
-            self._dps_window = DetachedWindow(self.root, self, "DPS MONITOR", CD, "dps", lambda parent, detached: self._build_dps(parent, detached=True), char_name=self.char_name)
-            self._fit()
         elif section == "msn" and not self._msn_detached:
             self._msn_detached = True
             self._msn_container.grid_remove()
@@ -3660,16 +3852,6 @@ class CharacterWindow:
             self._build_isk(self._isk_container, detached=False)
             self._isk_container.grid()
             self._sep_isk_msn.grid()
-            self._fit()
-        elif section == "dps":
-            self._dps_detached = False
-            self._dps_window = None
-            self._dps_det_labels = {}
-            for w in self._dps_container.winfo_children():
-                w.destroy()
-            self._build_dps(self._dps_container, detached=False)
-            self._dps_container.grid()
-            self._sep_anom_dps.grid()
             self._fit()
         elif section == "msn":
             self._msn_detached = False
@@ -3711,24 +3893,10 @@ class CharacterWindow:
                 d.anom_completed.append(d.anom_current)
                 d.anom_current = None
         if d.anom_current is None:
-            d.anom_current = {"start": ts, "end": None, "kills": 0, "isk": 0, "dmg_d": 0, "dmg_r": 0, "hits": 0}
+            d.anom_current = {"start": ts, "end": None, "kills": 0, "isk": 0}
             self._anom_start_wall = time.monotonic()
         d.anom_last_combat = ts
         self._anom_last_wall = time.monotonic()
-
-    # Ajoute les dégâts infligés à l'anomalie en cours
-    def _anom_add_dmg_out(self, ts, amount):
-        d = self.data
-        if d.anom_current:
-            d.anom_current["dmg_d"] += amount
-            d.anom_current["hits"] += 1
-
-    # Ajoute les dégâts reçus à l'anomalie en cours
-    def _anom_add_dmg_in(self, ts, amount):
-        d = self.data
-        if d.anom_current:
-            d.anom_current["dmg_r"] += amount
-            d.anom_current["hits"] += 1
 
     # Incrémente le compteur de kills et ISK de l'anomalie en cours
     def _anom_add_bounty(self, ts, amount):
@@ -3761,7 +3929,7 @@ class CharacterWindow:
         completed = d.anom_completed
         n = len(completed)
         if n > 0:
-            total_time = sum((a["end"] - a["start"]).total_seconds() for a in completed if a["end"] and a["start"])
+            total_time = sum(max(0, (a["end"] - a["start"]).total_seconds()) for a in completed if a["end"] and a["start"])
             avg_time = total_time / n
         else:
             avg_time = 0
@@ -3933,6 +4101,11 @@ class MainUISettings:
         for win in mu._windows.values():
             win.log_path  = cfg["log_path"]
             win.chat_path = cfg["chat_path"]
+        # Re-point the watchdog observer at the new directories
+        try:
+            mu._start_log_observer()
+        except Exception:
+            pass
 
         try:
             v     = max(20, min(100, int(self.av.get())))
@@ -3950,11 +4123,14 @@ class MainUISettings:
                 win.alpha = alpha
                 if win.root.winfo_exists():
                     win.root.attributes("-alpha", alpha)
-                for attr in ("_isk_window", "_dps_window", "_msn_window",
+                for attr in ("_isk_window", "_msn_window",
                              "_anom_window", "_alert_window"):
                     dw = getattr(win, attr, None)
                     if dw and dw.w.winfo_exists():
                         dw.w.attributes("-alpha", alpha)
+                ov = mu._overlays.get(win.char_id)
+                if ov and ov.w.winfo_exists():
+                    ov.apply_alpha(alpha)
         except Exception:
             pass
 
@@ -4009,12 +4185,16 @@ class MainUISettings:
                     win.char_cfg["theme"] = new_theme
                     _walk(win.root)
                     win.root.configure(bg=BG, highlightbackground=BDG, highlightcolor=BDG)
-                    for attr in ('_isk_window', '_dps_window', '_msn_window',
+                    for attr in ('_isk_window', '_msn_window',
                                  '_anom_window', '_alert_window'):
                         dw = getattr(win, attr, None)
                         if dw and dw.w.winfo_exists():
                             _walk(dw.w)
                             dw.w.configure(bg=BG, highlightbackground=BDG, highlightcolor=BDG)
+                    ov = mu._overlays.get(win.char_id)
+                    if ov and ov.w.winfo_exists():
+                        _walk(ov.w)
+                        ov.w.configure(bg=BG, highlightbackground=BDG, highlightcolor=BDG)
                     for attr in ('_sw', '_hw'):
                         obj = getattr(win, attr, None)
                         if obj and obj.w.winfo_exists():
@@ -4189,7 +4369,11 @@ class FleetManager:
         currently_active = char_id in mu._windows
 
         if currently_active:
-            # Remove from fleet — close window and mark ignored
+            # Remove from fleet — close overlay + window and mark ignored
+            ov = mu._overlays.get(char_id)
+            if ov:
+                try: ov.close()
+                except Exception: pass
             win = mu._windows.pop(char_id, None)
             if win and win.root.winfo_exists():
                 win._quit()
@@ -4217,13 +4401,46 @@ class FleetManager:
 
 
 # ── Fleet overview ────────────────────────────────────────────────────
+# ── Watchdog handler: wakes log readers on real file I/O (optional) ───
+class _LogEventHandler(FileSystemEventHandler):
+    """Debounced: coalesces bursts of file events into one read on the main thread."""
+    def __init__(self, main_ui):
+        self._mu = main_ui
+        self._pending = None
+
+    def _schedule(self):
+        if self._pending is not None:
+            return
+        def _fire():
+            self._pending = None
+            try:
+                self._mu._wake_readers()
+            except Exception:
+                pass
+        try:
+            self._pending = self._mu.root.after(300, _fire)
+        except Exception:
+            self._pending = None
+
+    def on_modified(self, event):
+        if not getattr(event, "is_directory", False):
+            try:
+                self._mu.root.after(0, self._schedule)
+            except Exception:
+                pass
+
+    def on_created(self, event):
+        self.on_modified(event)
+
+
 class MainUI:
 
     MAIN_W    = 420   # default & minimum window width
     # Treeview column pixel widths (fixed columns; char column stretches)
-    _TV_NET  = 85    # TOTAL NET
+    _TV_NET  = 100   # TOTAL NET (wide enough for the "TOTAL NET" header so it doesn't overflow)
     _TV_HR   = 85    # ISK/HR
     _TV_SES  = 68    # SESSION (HH:MM:SS)
+    _TV_DPS  = 30    # DPS overlay toggle glyph
 
     def __init__(self):
         self.root = tk.Tk()
@@ -4237,6 +4454,7 @@ class MainUI:
         self.root.attributes("-alpha", self.cfg.get("alpha", DEF_ALPHA))
 
         self._windows: dict = {}   # char_id → CharacterWindow
+        self._overlays: dict = {}  # char_id → DPSOverlay
         self._rows:    dict = {}   # char_id → iid in _tree (iid == char_id)
         self._tree            = None
         self._total_bnt_lbl   = None
@@ -4255,6 +4473,7 @@ class MainUI:
         self._full_height    = 0
         self._dragging       = False
         self._tray_icon      = None
+        self._log_observer   = None   # watchdog Observer (None ⇒ pure timer polling)
 
         self._build()
         self._restore_geometry()
@@ -4272,6 +4491,7 @@ class MainUI:
         self._scan()
         self._health_check()
         self._auto_scan()
+        self._start_log_observer()
 
         if _TRAY_OK:
             self.root.after(500, self._init_tray_icon)
@@ -4390,6 +4610,41 @@ class MainUI:
         self._scan()
         self._scan_job = self.root.after(10_000, self._auto_scan)
 
+    # ── Event-driven log watching (optional; falls back to timer polling) ──
+    def _start_log_observer(self):
+        """Watch the gamelog + chatlog dirs so reads fire on real I/O.
+        No-op (pure polling) when the watchdog package isn't installed."""
+        obs = getattr(self, "_log_observer", None)
+        if obs is not None:
+            try:
+                obs.stop(); obs.join(timeout=2.0)
+            except Exception:
+                pass
+            self._log_observer = None
+        if not _WATCHDOG_OK:
+            return
+        try:
+            handler = _LogEventHandler(self)
+            obs = Observer()
+            seen = set()
+            for d in (self.cfg.get("log_path", DEF_PATH), self.cfg.get("chat_path", DEF_CHAT)):
+                if d and os.path.isdir(d) and os.path.normcase(d) not in seen:
+                    obs.schedule(handler, d, recursive=False)
+                    seen.add(os.path.normcase(d))
+            obs.start()
+            self._log_observer = obs
+        except Exception:
+            self._log_observer = None
+
+    def _wake_readers(self):
+        """File event fired — read new log data for every live character window."""
+        for win in list(self._windows.values()):
+            try:
+                if win.root.winfo_exists():
+                    win._read_logs_once()
+            except Exception:
+                pass
+
     # ── Build the overview window UI ─────────────────────────────────
     def _build(self):
         F8B  = tkfont.Font(family="Consolas", size=8,  weight="bold")
@@ -4504,35 +4759,37 @@ class MainUI:
         # ── Treeview ──────────────────────────────────────────────────
         self._tree = ttk.Treeview(
             body, style="RatTV.Treeview",
-            columns=("char", "net", "isk_hr", "session"),
+            columns=("char", "net", "isk_hr", "session", "dps"),
             show="headings", selectmode="none", takefocus=False,
         )
         tv = self._tree
 
+        # Headers + cells all centered (except CHARACTER, left) so each header sits
+        # centered over its value — center-over-center aligns by construction and
+        # avoids ttk's heading-vs-cell right-inset mismatch.
         tv.heading("char",    text="CHARACTER", anchor="w", command=lambda: None)
-        tv.heading("net",     text="TOTAL NET",  anchor="w", command=lambda: None)
-        tv.heading("isk_hr",  text="ISK/HR",     anchor="w", command=lambda: None)
-        tv.heading("session", text="SESSION",    anchor="w", command=lambda: None)
+        tv.heading("net",     text="TOTAL NET",  anchor="center", command=lambda: None)
+        tv.heading("isk_hr",  text="ISK/HR",     anchor="center", command=lambda: None)
+        tv.heading("session", text="SESSION",    anchor="center", command=lambda: None)
+        tv.heading("dps",     text="DPS",        anchor="center", command=lambda: None)
 
-        tv.column("char",    stretch=True,  minwidth=80,  width=140, anchor="w")
-        tv.column("net",     stretch=False, minwidth=self._TV_NET,  width=self._TV_NET,  anchor="e")
-        tv.column("isk_hr",  stretch=False, minwidth=self._TV_HR,   width=self._TV_HR,   anchor="e")
-        tv.column("session", stretch=False, minwidth=self._TV_SES,  width=self._TV_SES,  anchor="e")
+        tv.column("char",    stretch=True,  minwidth=60,  width=140, anchor="w")
+        tv.column("net",     stretch=False, minwidth=24,  width=self._TV_NET,  anchor="center")
+        tv.column("isk_hr",  stretch=False, minwidth=24,  width=self._TV_HR,   anchor="center")
+        tv.column("session", stretch=False, minwidth=24,  width=self._TV_SES,  anchor="center")
+        tv.column("dps",     stretch=False, minwidth=24,  width=self._TV_DPS,  anchor="center")
+
+        # Restore any user-customised column widths from a previous session.
+        self._restore_col_widths()
 
         # Green ★ = window visible, orange ★ = window hidden
         tv.tag_configure("vis", foreground=CI)
         tv.tag_configure("hid", foreground=CW)
 
-        tv.pack(fill="both", expand=True)
-        tv.bind("<MouseWheel>",      lambda e: tv.yview_scroll(int(-1*(e.delta/120)), "units"))
-        tv.bind("<ButtonRelease-1>", self._on_row_click)
-        tv.bind("<Motion>",          self._on_row_motion)
-        tv.bind("<Leave>",           lambda e: tv.configure(cursor=""))
-
-        # ── Fleet total row ───────────────────────────────────────────
-        tk.Frame(body, bg=BD, height=1).pack(fill="x", pady=(3, 0))
+        # ── Ligne « Fleet Total » — ancrée en bas en premier pour rester toujours visible ──
+        tk.Frame(body, bg=BD, height=1).pack(side="bottom", fill="x", pady=(3, 0))
         total_row = tk.Frame(body, bg=BG)
-        total_row.pack(fill="x", pady=(2, 0))
+        total_row.pack(side="bottom", fill="x", pady=(2, 0))
         self._total_name_lbl = tk.Label(total_row, text="FLEET TOTAL",
                                          font=F8B, bg=BG, fg=TD, anchor="w")
         self._total_name_lbl.pack(side="left", padx=(2, 0))
@@ -4544,6 +4801,15 @@ class MainUI:
                                         font=F8B, bg=BG, fg=CI, anchor="e",
                                         width=12)
         self._total_net_lbl.pack(side="left")
+
+        # ── Treeview — remplit l'espace restant entre le header et le total ──
+        tv.pack(fill="both", expand=True)
+        tv.bind("<MouseWheel>",      lambda e: tv.yview_scroll(int(-1*(e.delta/120)), "units"))
+        tv.bind("<ButtonRelease-1>", self._on_row_click)
+        tv.bind("<ButtonRelease-1>", self._save_col_widths, add="+")  # persist column drags
+        tv.bind("<Button-3>",        self._on_row_right)
+        tv.bind("<Motion>",          self._on_row_motion)
+        tv.bind("<Leave>",           lambda e: tv.configure(cursor=""))
 
         self.root.bind("<Configure>", self._on_main_resize)
 
@@ -4561,9 +4827,11 @@ class MainUI:
             visible  = win.root.winfo_viewable()
             name_txt = f"★ {win.char_name[:18]}" + ("…" if len(win.char_name) > 18 else "")
             tv.insert("", "end", iid=char_id,
-                      values=(name_txt, "—", "— STANDBY —", "00:00:00"),
+                      values=(name_txt, "-", "-", "00:00:00", "○"),
                       tags=("vis" if visible else "hid",))
             self._rows[char_id] = char_id   # iid == char_id
+            self._restore_overlay(char_id)
+            self._reflect_overlay_state(char_id)
 
         self.root.update_idletasks()
         self._resize_char_col()
@@ -4586,11 +4854,106 @@ class MainUI:
         self._tv_cache[key] = tag
         self._tree.item(iid, tags=(tag,))
 
+    def _tv_col_name(self, event):
+        """Logical column name under the pointer (or None)."""
+        try:
+            cols = self._tree["columns"]
+            cid = self._tree.identify_column(event.x)   # like "#5"
+            idx = int(cid[1:]) - 1
+            if 0 <= idx < len(cols):
+                return cols[idx]
+        except Exception:
+            pass
+        return None
+
     def _on_row_click(self, event):
-        """Click on any cell in a row toggles that character's window."""
+        """Left-click the DPS cell → toggle that character's DPS overlay;
+        any other cell → toggle the character's dashboard window."""
         iid = self._tree.identify_row(event.y)
-        if iid and self._tree.identify_region(event.x, event.y) == "cell":
+        if not iid or self._tree.identify_region(event.x, event.y) != "cell":
+            return
+        if self._tv_col_name(event) == "dps":
+            self._toggle_overlay(iid)
+        else:
             self._toggle_window(iid)
+
+    def _on_row_right(self, event):
+        """Right-click the DPS cell → overlay context menu
+        (open / reposition / view / close)."""
+        iid = self._tree.identify_row(event.y)
+        if not (iid and self._tree.identify_region(event.x, event.y) == "cell"
+                and self._tv_col_name(event) == "dps"):
+            return
+        ov = self._overlays.get(iid)
+        m = tk.Menu(self._tree, tearoff=0, bg=BG_H, fg=TB,
+                    activebackground=BDG, activeforeground=TB, bd=0, relief="flat")
+        if ov and ov.w.winfo_exists():
+            m.add_command(label="Reposition", command=lambda: ov.toggle_lock(force=False))
+            vv = tk.IntVar(value=ov.view)
+            m._vv = vv  # keep a reference alive while the menu is up
+            sub = tk.Menu(m, tearoff=0, bg=BG_H, fg=TB,
+                          activebackground=BDG, activeforeground=TB, bd=0, relief="flat")
+            for i, name in enumerate(("Numbers", "Graph", "Numbers + graph")):
+                sub.add_radiobutton(label=name, value=i, variable=vv,
+                                    command=lambda idx=i: ov.set_view(idx))
+            m.add_cascade(label="View", menu=sub)
+            m.add_separator()
+            m.add_command(label="Close overlay", command=ov.close)
+        else:
+            m.add_command(label="Open DPS overlay", command=lambda: self._toggle_overlay(iid))
+        try:
+            m.tk_popup(event.x_root, event.y_root)
+        finally:
+            m.grab_release()
+
+    # ── DPS overlay management ────────────────────────────────────────
+    def _toggle_overlay(self, char_id):
+        win = self._windows.get(char_id)
+        if not win or not win.root.winfo_exists():
+            return
+        ov = self._overlays.get(char_id)
+        if ov and ov.w.winfo_exists():
+            ov.close()
+            return
+        win._overlay_active = True
+        self._overlays[char_id] = DPSOverlay(self, win)
+        win.char_cfg["dps_overlay_open"] = True
+        save_config(self.cfg)
+        self._reflect_overlay_state(char_id)
+
+    def _restore_overlay(self, char_id):
+        """Idempotently re-open an overlay if the character's config says it was open."""
+        win = self._windows.get(char_id)
+        if not win or self._overlays.get(char_id):
+            return
+        if win.char_cfg.get("dps_overlay_open", False):
+            win._overlay_active = True
+            self._overlays[char_id] = DPSOverlay(self, win)
+            self._reflect_overlay_state(char_id)
+
+    def _on_overlay_closed(self, char_id):
+        self._overlays.pop(char_id, None)
+        win = self._windows.get(char_id)
+        if win:
+            win._overlay_active = False
+        self._reflect_overlay_state(char_id)
+
+    def _reflect_overlay_state(self, char_id):
+        """Set the row's DPS glyph: ○ closed, ◉ placed (set), ✜ move mode."""
+        if char_id not in self._rows:
+            return
+        ov = self._overlays.get(char_id)
+        glyph = "○"
+        if ov and getattr(ov, "w", None) is not None:
+            try:
+                if ov.w.winfo_exists():
+                    glyph = "◉" if ov.locked else "✜"
+            except Exception:
+                pass
+        try:
+            self._tv_set(char_id, "dps", glyph)
+        except Exception:
+            pass
 
     def _on_row_motion(self, event):
         """Show hand cursor when hovering over a data row."""
@@ -4598,13 +4961,46 @@ class MainUI:
         self._tree.configure(cursor="hand2" if region == "cell" else "")
 
     def _resize_char_col(self):
-        """Make the CHARACTER column fill all space the Treeview gives it."""
+        """Make the CHARACTER column fill all space left by the fixed columns
+        (using their CURRENT widths, so user-resized columns are respected)."""
         if not self._tree:
             return
         tv_w  = self._tree.winfo_width() or self.MAIN_W
-        fixed = self._TV_NET + self._TV_HR + self._TV_SES
-        char_w = max(80, tv_w - fixed)
+        try:
+            fixed = sum(self._tree.column(c, "width")
+                        for c in ("net", "isk_hr", "session", "dps"))
+        except Exception:
+            fixed = self._TV_NET + self._TV_HR + self._TV_SES + self._TV_DPS
+        char_w = max(60, tv_w - fixed)
         self._tree.column("char", width=char_w)
+
+    def _restore_col_widths(self):
+        """Apply saved per-column widths for the fixed columns (if any)."""
+        saved = self.cfg.get("main_ui", {}).get("col_widths", {})
+        if not saved or not self._tree:
+            return
+        for col in ("net", "isk_hr", "session", "dps"):
+            w = saved.get(col)
+            if isinstance(w, int) and w >= 20:
+                try:
+                    self._tree.column(col, width=w)
+                except Exception:
+                    pass
+
+    def _save_col_widths(self, event=None):
+        """Persist fixed-column widths after the user drags a header separator
+        (only writes config when a width actually changed)."""
+        if not self._tree:
+            return
+        try:
+            widths = {c: self._tree.column(c, "width")
+                      for c in ("net", "isk_hr", "session", "dps")}
+            mui = self.cfg.setdefault("main_ui", {})
+            if mui.get("col_widths") != widths:
+                mui["col_widths"] = widths
+                save_config(self.cfg)
+        except Exception:
+            pass
 
     # ── Live stats update + frozen detection ─────────────────────────
     def _lset(self, lbl, text=None, fg=None):
@@ -4645,7 +5041,7 @@ class MainUI:
                 d       = win.data
                 net_tot = d.bg * (1 - d.tax) + d.loot_val
                 self._tv_tag(char_id, "standby", False)   # orange — offline
-                self._tv_set(char_id, "net",     fisk(net_tot) if net_tot > 0 else "—")
+                self._tv_set(char_id, "net",     fisk(net_tot) if net_tot > 0 else "-")
                 self._tv_set(char_id, "isk_hr",  "— OFFLINE —")
                 self._tv_set(char_id, "session", fdur(d.acc_sec) if d.acc_sec > 0 else "00:00:00")
                 continue
@@ -4677,13 +5073,13 @@ class MainUI:
                 self._tv_set(char_id, "session", fdur(sec))
             elif st == "paused":
                 self._tv_tag(char_id, "paused", vis)
-                self._tv_set(char_id, "net",     fisk(net_tot) if net_tot > 0 else "—")
+                self._tv_set(char_id, "net",     fisk(net_tot) if net_tot > 0 else "-")
                 self._tv_set(char_id, "isk_hr",  "— PAUSED —")
                 self._tv_set(char_id, "session", fdur(sec))
             else:
                 self._tv_tag(char_id, "standby", vis)
-                self._tv_set(char_id, "net",     fisk(net_tot) if net_tot > 0 else "—")
-                self._tv_set(char_id, "isk_hr",  "— STANDBY —")
+                self._tv_set(char_id, "net",     fisk(net_tot) if net_tot > 0 else "-")
+                self._tv_set(char_id, "isk_hr",  "-")
                 self._tv_set(char_id, "session", fdur(sec) if sec > 0 else "00:00:00")
 
         if running_n >= 2:
@@ -4706,7 +5102,7 @@ class MainUI:
 
         if win.root.winfo_viewable():
             # HIDE — withdraw main + all detached panels (keep widgets alive for _tick)
-            panels = [("isk", "_isk_window"), ("dps", "_dps_window"),
+            panels = [("isk", "_isk_window"),
                       ("msn", "_msn_window"), ("anom", "_anom_window"),
                       ("alert", "_alert_window")]
             was_detached = []
@@ -4722,8 +5118,8 @@ class MainUI:
             win._hidden_detached = was_detached
             win.root.withdraw()
             char_cfg["show"] = False
-            if bg_monitor:
-                # Keep monitoring — only hide the UI, don't suspend log reading
+            if bg_monitor or getattr(win, "_overlay_active", False):
+                # Keep monitoring — bg-monitor on, or a DPS overlay is open for this char
                 win._suspended = False
             else:
                 win._suspended = True      # stop log reading for this character
@@ -4734,7 +5130,7 @@ class MainUI:
             # SHOW — restore main window and all panels that were visible before hide
             win.root.deiconify()
             win.root.lift()
-            panels = [("isk", "_isk_window"), ("dps", "_dps_window"),
+            panels = [("isk", "_isk_window"),
                       ("msn", "_msn_window"), ("anom", "_anom_window"),
                       ("alert", "_alert_window")]
             for key, attr in panels:
@@ -4899,7 +5295,7 @@ class MainUI:
                 if show:
                     win.root.deiconify()
                     win.root.lift()
-                    for attr in ("_isk_window", "_dps_window", "_msn_window",
+                    for attr in ("_isk_window", "_msn_window",
                                  "_anom_window", "_alert_window"):
                         dw = getattr(win, attr, None)
                         if dw and dw.w.winfo_exists():
@@ -4924,10 +5320,22 @@ class MainUI:
         if self._scan_job:
             self.root.after_cancel(self._scan_job)
             self._scan_job = None
+        obs = getattr(self, "_log_observer", None)
+        if obs is not None:
+            try:
+                obs.stop(); obs.join(timeout=2.0)
+            except Exception:
+                pass
+            self._log_observer = None
         self._save_pos()
         if self._tray_icon:
             try:
                 self._tray_icon.stop()
+            except Exception:
+                pass
+        for ov in list(self._overlays.values()):
+            try:
+                ov.close()
             except Exception:
                 pass
         for win in list(self._windows.values()):

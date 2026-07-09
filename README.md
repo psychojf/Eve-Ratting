@@ -6,8 +6,8 @@ The tool is a single Python script (or standalone `.exe`) using Tkinter. A **fle
 
 ## Features
 
-- **Fleet overview** — one hub window lists every detected character with live gross ISK/hr, net ISK/hr and session time; new characters appear automatically every 10 seconds
-- **Per-character dashboards** — each pilot gets its own always-on-top, resizable, draggable window
+- **Fleet overview** — one hub window lists every detected character in a compact table (TOTAL NET, ISK/HR, session time, and a per-character DPS-overlay toggle); columns are centered and can be dragged to resize, with widths and window geometry remembered; new characters appear automatically every 10 seconds
+- **Per-character dashboards** — each pilot gets its own always-on-top, draggable window that auto-sizes to its content
 - **Live combat tracking** — outgoing/incoming DPS over a sliding 15-second window, total damage dealt and received, hits and misses, peak DPS
 - **ISK metrics** — gross bounties, configurable tax rate, loot estimation, net ISK and ISK/hour with a collapsible breakdown panel
 - **Bounty backfill** — on Play, the last 15 minutes of the log are replayed so recent bounties are never missed
@@ -17,7 +17,8 @@ The tool is a single Python script (or standalone `.exe`) using Tkinter. A **fle
 - **Loot clipboard** — paste an EVE cargo/loot window (Ctrl+A, Ctrl+C) while running; prices are looked up via ESI (Jita sell for faction/deadspace items, universe average for everything else, with an offline fallback table)
 - **Standings tracker** — captures faction standing changes from the gamelog
 - **Session history** — persistent JSON history with lifetime totals; browsable per-character in a scrollable popup
-- **Detached panels** — pop any section (ISK, DPS, Missions, Anomalies, Alerts) out into its own always-on-top resizable window; positions remembered between sessions
+- **Detached panels** — pop any section (ISK, Missions, Anomalies, Alerts) out into its own always-on-top resizable window; positions remembered between sessions
+- **DPS overlay** — a standalone, transparent DPS overlay per character that floats over your ship like EVE's own combat "messages" frame: just the **DPS OUT** (blue) and **DPS IN** (red) numbers — and an optional live graph — over the game, with no window box. **Left-click** the **DPS** cell in the Fleet Overview to open/close it; **right-click** that cell for a menu (**Reposition** · **View ▸ Numbers / Graph / Numbers+graph** · **Close**). A fresh overlay opens in *move mode* (white outline + ✕ + resize grip); drag it over your ship, then click **✕** to *set* it — once placed the box disappears, leaving only the text, and it becomes **click-through** so your mouse passes straight to EVE. Independent of the global opacity slider; position, size, view and placed/move state are remembered per character. *Transparency and click-through are Windows-only, and a topmost overlay draws over EVE only in Fixed-Window or Borderless mode, not exclusive fullscreen.*
 - **Collapsible sections** — each panel can be collapsed to its header bar to save screen space; the whole window can be collapsed to just its title bar with a double-click
 - **22+ themes** — EVE Online default plus faction palettes (Caldari, Minmatar, Amarr, Gallente, Guristas, Blood Raiders, Angel Cartel, Serpentis, Sansha's Nation, Triglavian, EDENCOM, Intaki Syndicate, ORE, Mordu's Legion, Thukker Tribe, CONCORD, Society of Conscious Thought and more); applied live with no flicker, saved per character
 - **Configurable opacity** — set window transparency from 20 % to 100 % (default 85 %)
@@ -49,6 +50,9 @@ Optional Python packages (the app runs without them, with reduced functionality)
 | `pystray` | System tray icon |
 | `Pillow` | Required by `pystray` for the tray image |
 | `pyperclip` | Clipboard paste support for loot estimation |
+| `watchdog` | Event-driven log watching (falls back to timer polling if absent) |
+
+Audio EWAR alerts (a short beep on warp-scramble / stasis-web) use `winsound`, which is part of the Python standard library on Windows — no install needed.
 
 ## Quick start
 
@@ -76,7 +80,7 @@ For a full walkthrough see [HOW_TO.txt](HOW_TO.txt).
 |---|---|
 | ▶ Play | Start the session timer; back-fills the last 15 min of bounties |
 | ⏸ Pause | Freeze the timer; parsing continues in the background |
-| ■ Stop | Save session to history and halt |
+| ■ Stop | Freeze the display and halt (the session is written to history on Reset, Next Site, or Quit) |
 | RESET | Save session and immediately start a fresh new session |
 | NEXT SITE | Close the current anomaly, save session data, and reset |
 
