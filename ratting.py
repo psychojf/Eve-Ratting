@@ -2002,6 +2002,17 @@ class CharacterWindow:
         if getattr(self, "_grip_bar", None) is not None:
             h += 16   # status bar / resize grip
 
+        # While collapsed the body is hidden and the window is pinned at 32px.
+        # Resizing it to the (still full) content height would leave blank space
+        # under the title bar — the exact glitch seen when a detached panel is
+        # re-attached while collapsed. Instead, just remember the new full height
+        # so the next expand restores the correct size (incl. the re-attached
+        # section), then leave the collapsed window untouched.
+        if self._is_collapsed:
+            self._full_height = h
+            self.char_cfg["main_full_height"] = h
+            return
+
         saved = self.char_cfg.get("geometry", "")
         if saved:
             saved_w = saved.split("x")[0] if "x" in saved else str(WIN_W)
