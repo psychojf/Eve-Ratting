@@ -239,7 +239,6 @@ def _find_eve_log_path(subdir):
     return candidates[0]  # fall back to Windows default even if missing
 
 DEF_PATH     = _find_eve_log_path("Gamelogs")
-DEF_CHAT     = _find_eve_log_path("Chatlogs")
 DEF_POLL     = 250
 DEF_TAX      = 12.5
 DEF_ALPHA    = 0.85  # Default set to 85%
@@ -312,11 +311,16 @@ RE_SCRAM = re.compile(
     r'|\(combat\)\s+Warp\s+scramble\s+attempt\s+from\s+([\w\s\'-]+?)\s+to\s+you',
     re.I
 )
-RE_WEB = re.compile(r'\(notify\)\s*.*?([\w\s\'-]+?)\s+has started webifying you', re.I)
-
-# ── Chatlog patterns (agent convos) ──────────────────────────────────
-RE_MSN_ACCEPT = re.compile(r'You have accepted the mission\s+"(.*?)"', re.I)
-RE_CHATLOG_FN = re.compile(r'^Agent_.*\.txt$',                         re.I)
+# WEB is a GAMELOG (notify) line, like every other (notify) event. It used to
+# be matched only against chatlog lines, which could never fire: chatlog lines
+# look like "[ ts ] Speaker > message" and never carry a "(notify)" tag at all.
+# Tolerates the tagged form too, the way RE_SCRAM does for the sibling EWAR
+# event (the plain form is what real gamelogs show; tags are cheap insurance).
+RE_WEB = re.compile(
+    r'\(notify\)\s*(?:<[^>]+>)*(?:<b>)?([\w\s\'-]+?)(?:</b>)?(?:<[^>]+>)*'
+    r'\s+has\s+started\s+webifying\s+you',
+    re.I
+)
 
 # ── Utility functions ────────────────────────────────────────────────
 # Supprime les balises HTML d'une chaîne
@@ -412,19 +416,39 @@ def rlisten(fp):
 
 # Scanne récursivement le dossier pour trouver les logs de combat par personnage
 def scan_logs(base):
-    r = {}          # char_id → newest log path
+    """char_id → path of that character's newest gamelog.
+
+    os.scandir instead of os.walk + os.path.getmtime: on Windows the DirEntry
+    already carries the metadata from the directory enumeration, so .stat() is
+    free, whereas getmtime() costs one extra syscall per file. EVE never prunes
+    the Gamelogs folder, so that cost grows for the life of the install — and
+    this runs on the Tk thread.
+    """
+    r  = {}         # char_id → newest log path
     mt = {}         # char_id → that path's mtime (avoids re-stat'ing on each compare)
     if not os.path.isdir(base): return r
-    for dp, dn, fns in os.walk(base):
-        for fn in fns:
-            m = RE_CF.match(fn)
-            if m:
-                c = m.group(3)
-                fp = os.path.join(dp, fn)
-                fmt = os.path.getmtime(fp)
-                if c not in r or fmt > mt[c]:
-                    r[c] = fp
-                    mt[c] = fmt
+    stack = [base]
+    while stack:
+        d = stack.pop()
+        try:
+            with os.scandir(d) as it:
+                for e in it:
+                    try:
+                        if e.is_dir(follow_symlinks=False):
+                            stack.append(e.path)
+                            continue
+                        m = RE_CF.match(e.name)
+                        if not m:
+                            continue
+                        c   = m.group(3)
+                        fmt = e.stat().st_mtime
+                        if c not in r or fmt > mt[c]:
+                            r[c]  = e.path
+                            mt[c] = fmt
+                    except OSError:
+                        continue
+        except OSError:
+            continue
     return r
 
 # Charge la configuration JSON depuis le disque
@@ -437,13 +461,31 @@ def load_config():
             pass
     return {}
 
-# Sauvegarde la configuration JSON sur le disque
-def save_config(cfg):
+# Écrit un JSON de façon atomique (fichier temporaire + os.replace).
+# open(path, "w") tronque la cible AVANT d'écrire : un crash ou une coupure de
+# courant en plein milieu laissait un ratting_config.json vide — donc toute la
+# config (géométries, sections, réglages par perso) perdue. Le cache de prix et
+# le cache nom→id utilisaient déjà ce motif ; config + historique non.
+def _atomic_write_json(path, payload, indent=2):
+    tmp = path + ".tmp"
     try:
-        with open(CONFIG_FILE, "w", encoding="utf-8") as f:
-            json.dump(cfg, f, indent=2, ensure_ascii=False)
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(payload, f, indent=indent, ensure_ascii=False)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
+        return True
     except Exception:
-        pass
+        try:
+            if os.path.exists(tmp):
+                os.remove(tmp)
+        except Exception:
+            pass
+        return False
+
+# Sauvegarde la configuration JSON sur le disque (écriture atomique)
+def save_config(cfg):
+    _atomic_write_json(CONFIG_FILE, cfg)
 
 # Charge l'historique des sessions depuis le disque
 def load_history():
@@ -455,13 +497,9 @@ def load_history():
             pass
     return []
 
-# Sauvegarde l'historique des sessions sur le disque
+# Sauvegarde l'historique des sessions sur le disque (écriture atomique)
 def save_history(entries):
-    try:
-        with open(HISTORY_FILE, "w", encoding="utf-8") as f:
-            json.dump(entries, f, indent=2, ensure_ascii=False)
-    except Exception:
-        pass
+    _atomic_write_json(HISTORY_FILE, entries)
 
 # Sauvegarde les données de la session courante dans l'historique
 def save_session(data, char_name, tax_pct):
@@ -594,7 +632,9 @@ class Data:
         self.pkd = self.pkr = 0         # Pics DPS sortants / entrants
 
         # Suivi de mission
-        self.mission_name = None        # Nom de la mission en cours (chatlog)
+        self.mission_name = None        # Toujours None : EVE n'ecrit le nom de la
+                                        # mission dans aucun log (ni gamelog ni
+                                        # chatlog) — conserve pour l'historique.
         self.mission_obj_met = False    # Drapeau « objectif accompli »
         self.missions_done = 0          # Missions terminées cette session
         self.alerts = deque(maxlen=MAX_ALERTS)  # [(timestamp_str, type, text), ...]
@@ -929,11 +969,7 @@ class Settings:
 
         tk.Label(body, text="GAMELOGS PATH", font=lf, bg=BG_POP, fg=TD).pack(anchor="w", pady=(0, 2))
         self.pv = tk.StringVar(value=app.log_path)
-        tk.Entry(body, textvariable=self.pv, width=36, **ek).pack(fill="x", pady=(0, 4))
-
-        tk.Label(body, text="CHATLOGS PATH", font=lf, bg=BG_POP, fg=TD).pack(anchor="w", pady=(0, 2))
-        self.cpv = tk.StringVar(value=app.chat_path)
-        tk.Entry(body, textvariable=self.cpv, width=36, **ek).pack(fill="x", pady=(0, 8))
+        tk.Entry(body, textvariable=self.pv, width=36, **ek).pack(fill="x", pady=(0, 8))
 
         for lbl, attr, default in [("UPDATE INTERVAL (ms)", "iv", str(app.poll_ms)),
                                      ("OPACITY %",           "av", str(int(app.alpha * 100))),
@@ -996,8 +1032,6 @@ class Settings:
         a = self.app
         a.log_path = self.pv.get().strip()
         a.cfg["log_path"] = a.log_path
-        a.chat_path = self.cpv.get().strip()
-        a.cfg["chat_path"] = a.chat_path
         try:
             a.poll_ms = max(100, int(self.iv.get()))
             a.cfg["poll_ms"] = a.poll_ms
@@ -1531,7 +1565,6 @@ class CharacterWindow:
         self.cfg       = cfg
         self.char_cfg  = cfg.setdefault("chars", {}).setdefault(char_id, {})
         self.log_path  = cfg.get("log_path", DEF_PATH)
-        self.chat_path = self.cfg.get("chat_path", DEF_CHAT)
         self.poll_ms  = self.cfg.get("poll_ms",  DEF_POLL)
         self.alpha    = self.cfg.get("alpha",    DEF_ALPHA)
         self.anom_gap = self.cfg.get("anom_gap", ANOM_GAP)
@@ -1549,6 +1582,12 @@ class CharacterWindow:
         self.cf = log_file if log_file else None
         self.fh = None
         self.fp = 0
+        # Partial-line carry-over + last observed byte size. EVE flushes mid-line,
+        # so a read often ends on half a line; parsing that half as a complete
+        # line (and advancing past it) dropped or mangled the event. See _read().
+        self._read_buf     = ""
+        self._read_size    = -1
+        self._read_seen_fp = None
         self._last_gamelog_scan = 0.0   # monotonic ts of last gamelog-rotation scan
         self._sw  = None
         self._hw = None
@@ -1556,10 +1595,6 @@ class CharacterWindow:
         self._poll_job = None        # after() id for the log-polling loop
         self._tick_job = None        # after() id for the UI-refresh loop
         self._alert_font_cache = {}  # size -> tkfont.Font, reused across redraws
-
-        self._chat_file = None
-        self._chat_fh = None
-        self._chat_fp = 0
 
         # Clipboard tracker state
         self._last_clipboard  = ""
@@ -1743,27 +1778,42 @@ class CharacterWindow:
 
     # ── Loot clipboard parsing ───────────────────────────────────────
     # Vérifie si le presse-papiers contient un inventaire EVE à parser
+    # Prend en charge un collage transmis par MainUI (qui lit le presse-papiers
+    # une seule fois pour toute la flotte — voir MainUI._poll_clipboard).
+    # Retourne True si cette fenêtre a bien démarré une estimation de loot.
+    def _accept_clipboard(self, content):
+        if self._st not in ("running", "paused"):
+            return False
+        # One loot lookup at a time per window: if one is already running, refuse
+        # so the caller leaves _last_clipboard untouched and the paste is retried
+        # on a later poll (no concurrent threads, no spinner-state interleave).
+        if self._loot_inflight:
+            return False
+        try:
+            if not self.root.winfo_exists():
+                return False
+            self._loot_inflight = True
+            self._loot_anim_start()
+            threading.Thread(target=self._process_loot_copy,
+                             args=(content,), daemon=True).start()
+            return True
+        except Exception:
+            self._loot_inflight = False
+            return False
+
+    # Chemin de repli : lecture directe du presse-papiers quand la fenêtre tourne
+    # sans MainUI (cas qui n'arrive pas dans l'app actuelle, mais _main_ui est
+    # déclaré optionnel — on garde donc l'ancien comportement autonome).
     def _check_clipboard(self):
         if not _CLIP_OK or self._st not in ("running", "paused"): return
         try:
             content = pyperclip.paste()
             if not content or "\t" not in content:
                 return
-            # Use shared clipboard tracker when running under MainUI so only one
-            # CharacterWindow processes each paste even with multiple chars active.
-            tracker = self._main_ui if self._main_ui else self
-            if content == tracker._last_clipboard:
+            if content == self._last_clipboard:
                 return
-            # One loot lookup at a time per window: if one is already running,
-            # leave _last_clipboard untouched so this paste is retried on a later
-            # poll once the in-flight lookup finishes (no concurrent threads,
-            # no spinner-state interleave).
-            if self._loot_inflight:
-                return
-            tracker._last_clipboard = content
-            self._loot_inflight = True
-            self._loot_anim_start()
-            threading.Thread(target=self._process_loot_copy, args=(content,), daemon=True).start()
+            if self._accept_clipboard(content):
+                self._last_clipboard = content
         except Exception:
             pass
 
@@ -3176,7 +3226,6 @@ class CharacterWindow:
         save_config(self.cfg)
         if self.fh:
             self.fh.close()
-        self._close_chatlog()
         # Cancel pending after() loops so they don't fire on destroyed widgets
         for _job in ("_poll_job", "_tick_job", "_loot_anim_job"):
             jid = getattr(self, _job, None)
@@ -3287,8 +3336,19 @@ class CharacterWindow:
             self._flash_alert()
             return
 
+        # EWAR \u2014 web fires as a (notify) line in this same gamelog. It used to be
+        # matched only against chatlog lines, which never carry a "(notify)" tag,
+        # so WEB alerts could never fire. ('(notify)' is already in the fast-skip
+        # keyword list above, so these lines reach this point.)
+        m = RE_WEB.search(raw)
+        if m:
+            npc = shtml(m.group(1).strip())
+            d.alerts.append((now_str, "WEB", f"\u26A0 WEBBED by {npc}!"))
+            self._flash_alert()
+            return
+
     # ── Polling loop (reads new log data) ────────────────────────────
-    # Lit une fois les nouveaux logs (gamelog + rotation + chatlog).
+    # Lit une fois les nouveaux logs (gamelog + detection de rotation).
     # Appelé par le timer _poll ET par le watchdog (sur événement fichier).
     def _read_logs_once(self):
         if getattr(self, "_suspended", False) or self._st != "running":
@@ -3296,10 +3356,6 @@ class CharacterWindow:
         try:
             self._read()
             self._check_gamelog_rotation()
-            latest_chat = self._find_latest_chatlog()
-            if latest_chat and latest_chat != self._chat_file:
-                self._open_chatlog()
-            self._read_chatlog()
         except Exception:
             pass
 
@@ -3321,9 +3377,9 @@ class CharacterWindow:
     # Boucle de mise à jour de l'UI (s'exécute toutes les poll_ms ms)
     def _tick(self):
         self._last_tick_wall = time.monotonic()
-        # Clipboard/loot polling lives here (not _poll) so it stays responsive
-        # even when the watchdog observer slows the _poll fallback interval.
-        if not getattr(self, "_suspended", False):
+        # Le presse-papiers est lu une seule fois pour toute la flotte par
+        # MainUI._poll_clipboard ; ici on ne lit que si la fenêtre tourne seule.
+        if self._main_ui is None and not getattr(self, "_suspended", False):
             self._check_clipboard()
         d = self.data
         try: d.tax = max(0, min(float(self.tax_var.get()) / 100, 1))
@@ -3459,7 +3515,6 @@ class CharacterWindow:
         self.fp = 0
         # Keep self.cf (the character's gamelog path) intact so Play (_go) can
         # restart the same character — closing fh forces _go to re-open from EOF.
-        self._close_chatlog()
         self._st = "stopped"
         self._update_buttons()
 
@@ -3545,13 +3600,51 @@ class CharacterWindow:
 
     # Lit les nouvelles lignes du fichier log depuis la dernière position
     def _read(self):
-        if not self.fh: return
-        self.fh.seek(self.fp)
-        for l in self.fh.readlines():
-            l = l.rstrip("\n\r")
+        fh = self.fh
+        if not fh: return
+
+        # self.fp was repositioned by someone else (Play's seek-to-EOF, _reset,
+        # gamelog rotation) → any carried partial line belongs to a stale offset.
+        if self.fp != self._read_seen_fp:
+            self._read_buf  = ""
+            self._read_size = -1
+
+        try:
+            # Truncation guard. If the file shrank (replaced or truncated in
+            # place) our saved offset now points past EOF, seek() lands beyond
+            # the end and the reader goes permanently deaf — restart from the
+            # top. Compared against the last observed BYTE SIZE, not against
+            # self.fp: text-mode tell() returns an opaque cookie, not an offset.
+            size = os.fstat(fh.fileno()).st_size
+            if 0 <= self._read_size and size < self._read_size:
+                self.fp = 0
+                self._read_buf = ""
+            self._read_size = size
+
+            fh.seek(self.fp)
+            chunk = fh.read()
+            self.fp = fh.tell()
+        except Exception:
+            return
+        self._read_seen_fp = self.fp
+
+        if not chunk:
+            return
+
+        # Only hand complete lines to _parse; keep the trailing fragment for the
+        # next read. This matters more since the watchdog landed — reads now fire
+        # on every flush instead of on a 250 ms timer, so catching EVE mid-write
+        # is common rather than rare.
+        buf = self._read_buf + chunk
+        cut = buf.rfind("\n")
+        if cut == -1:
+            self._read_buf = buf
+            return
+        self._read_buf = buf[cut + 1:]
+        for l in buf[:cut].split("\n"):
+            l = l.rstrip("\r")
             if l.strip():
                 self._parse(l)
-        self.fp = self.fh.tell()
 
     # Détecte un nouveau gamelog pour ce personnage (EVE écrit un nouveau fichier
     # par session de jeu au relog/undock) et bascule dessus, pour qu'une session
@@ -3564,7 +3657,14 @@ class CharacterWindow:
         if not self.cf:
             return
         try:
-            latest = scan_logs(self.log_path).get(self.char_id)
+            # Reuse MainUI's shared scan when available: otherwise every
+            # CharacterWindow walked the whole Gamelogs tree on its own 5 s
+            # rotation check — N full directory walks instead of one.
+            mu = self._main_ui
+            if mu is not None:
+                latest = mu._scan_map().get(self.char_id)
+            else:
+                latest = scan_logs(self.log_path).get(self.char_id)
         except Exception:
             return
         if not latest or os.path.normcase(latest) == os.path.normcase(self.cf):
@@ -3589,91 +3689,15 @@ class CharacterWindow:
         except Exception:
             self.fh = None
 
-    # Retourne le chemin du fichier chatlog le plus récent dans le dossier EVE
-    def _find_latest_chatlog(self):
-        chat_dir = self.chat_path
-        if not os.path.isdir(chat_dir): return None
-        best = None
-        best_mt = 0
-        # EVE chatlog files are Agent_<date>_<time>_<charid>.txt. Match only THIS
-        # character's logs, otherwise every window tails whichever character's
-        # Agent log is globally newest and misattributes its WEB alerts.
-        suffix = f"_{self.char_id}.txt"
-        try:
-            for fn in os.listdir(chat_dir):
-                if RE_CHATLOG_FN.match(fn) and fn.endswith(suffix):
-                    fp = os.path.join(chat_dir, fn)
-                    mt = os.path.getmtime(fp)
-                    if mt > best_mt:
-                        best = fp
-                        best_mt = mt
-        except Exception:
-            pass
-        return best
-
-    # Ouvre le chatlog le plus récent en UTF-16 et positionne le curseur en fin de fichier
-    def _open_chatlog(self):
-        fp = self._find_latest_chatlog()
-        if not fp: return
-        if fp != self._chat_file:
-            if self._chat_fh:
-                try: self._chat_fh.close()
-                except Exception:
-                    pass
-            try:
-                self._chat_fh = open(fp, "r", encoding="utf-16", errors="ignore")
-                self._chat_fh.seek(0, 2)
-                self._chat_fp = self._chat_fh.tell()
-                self._chat_file = fp
-            except Exception:
-                self._chat_fh = None
-                self._chat_file = None
-
-    # Lit les nouvelles lignes du chatlog depuis la dernière position
-    def _read_chatlog(self):
-        if not self._chat_fh: return
-        try:
-            self._chat_fh.seek(self._chat_fp)
-            for l in self._chat_fh.readlines():
-                l = l.rstrip("\n\r")
-                if l.strip():
-                    self._parse_chatlog(l)
-            self._chat_fp = self._chat_fh.tell()
-        except Exception:
-            pass
-
-    # Analyse une ligne du chatlog et déclenche les alertes (ex: web, scram)
-    def _parse_chatlog(self, raw):
-        d = self.data
-        now_str = datetime.now().strftime("%H:%M:%S")
-
-        # WEB fires as (notify) in chatlog (unlike SCRAM which is in combat log)
-        m = RE_WEB.search(raw)
-        if m:
-            npc = shtml(m.group(1).strip())
-            d.alerts.append((now_str, "WEB", f"\u26A0 WEBBED by {npc}!"))
-            self._flash_alert()
-            return
-
-        # Accepted-mission line names the current mission (drives the mission
-        # tracker + history 'last_mission'; previously RE_MSN_ACCEPT was unused
-        # so mission_name never populated).
-        m = RE_MSN_ACCEPT.search(raw)
-        if m:
-            d.mission_name = m.group(1).strip()
-            d.mission_obj_met = False
-            d.alerts.append((now_str, "MSN", f"Accepted: {d.mission_name[:32]}"))
-            return
-
-    # Ferme le handle du chatlog et réinitialise les variables associées
-    def _close_chatlog(self):
-        if self._chat_fh:
-            try: self._chat_fh.close()
-            except Exception:
-                pass
-            self._chat_fh = None
-            self._chat_file = None
-            self._chat_fp = 0
+    # NOTE — the chatlog reader that used to live here was removed.
+    # It matched chatlog files named 'Agent_*.txt' to scrape agent
+    # conversations, but EVE names chatlogs after the CHANNEL
+    # ('Local_<date>_<time>_<charid>.txt'), and agent conversations are not
+    # chat channels, so no such file is ever written: 17 000+ chatlogs across
+    # 55 channel names on this install contained zero 'Agent_' files. The two
+    # things it fed were WEB alerts — which needed a '(notify)' tag that
+    # chatlog lines never carry, and now correctly live in _parse() against
+    # the gamelog — and Data.mission_name, which EVE gives no log source for.
 
     # Reconstruit entièrement l'interface en appliquant le thème courant sans perdre l'état
     def _apply_theme_live(self):
@@ -3796,14 +3820,6 @@ class CharacterWindow:
                 self.data.anom_last_combat = datetime.now(timezone.utc)
                 self._anom_last_wall  = time.monotonic()
                 self._anom_start_wall = time.monotonic() - self._anom_paused_secs
-
-        self._open_chatlog()
-        if was_suspended and self._chat_fh:
-            try:
-                self._chat_fh.seek(0, 2)
-                self._chat_fp = self._chat_fh.tell()
-            except Exception:
-                pass
 
     # Met en pause la session (fige les timers) ou la reprend si déjà en pause
     def _pause(self):
@@ -4005,12 +4021,7 @@ class MainUISettings:
         tk.Label(body, text="GAMELOGS PATH", font=lf, bg=BG_POP, fg=TD).pack(
             anchor="w", pady=(0, 2))
         self.pv = tk.StringVar(value=cfg.get("log_path", DEF_PATH))
-        tk.Entry(body, textvariable=self.pv, width=36, **ek).pack(fill="x", pady=(0, 4))
-
-        tk.Label(body, text="CHATLOGS PATH", font=lf, bg=BG_POP, fg=TD).pack(
-            anchor="w", pady=(0, 2))
-        self.cpv = tk.StringVar(value=cfg.get("chat_path", DEF_CHAT))
-        tk.Entry(body, textvariable=self.cpv, width=36, **ek).pack(fill="x", pady=(0, 8))
+        tk.Entry(body, textvariable=self.pv, width=36, **ek).pack(fill="x", pady=(0, 8))
 
         r = tk.Frame(body, bg=BG_POP)
         r.pack(fill="x", pady=(0, 6))
@@ -4055,7 +4066,6 @@ class MainUISettings:
         # Snapshot of values at open time — used to detect changes
         self._snap = {
             "log":   self.pv.get(),
-            "chat":  self.cpv.get(),
             "alpha": self.av.get(),
             "tax":   self.tv.get(),
             "theme": self._theme_var.get(),
@@ -4069,13 +4079,12 @@ class MainUISettings:
         self._ap_dirty = False
 
         # Trace StringVars so any keystroke updates dirty state
-        for var in (self.pv, self.cpv, self.av, self.tv, self._theme_var):
+        for var in (self.pv, self.av, self.tv, self._theme_var):
             var.trace_add("write", lambda *_: self._check_dirty())
 
     def _check_dirty(self):
         dirty = (
             self.pv.get()          != self._snap["log"]   or
-            self.cpv.get()         != self._snap["chat"]  or
             self.av.get()          != self._snap["alpha"] or
             self.tv.get()          != self._snap["tax"]   or
             self._theme_var.get()  != self._snap["theme"] or
@@ -4108,11 +4117,9 @@ class MainUISettings:
         mu  = self.main_ui
         cfg = mu.cfg
         cfg["log_path"]  = self.pv.get().strip()
-        cfg["chat_path"] = self.cpv.get().strip()
         for win in mu._windows.values():
             win.log_path  = cfg["log_path"]
-            win.chat_path = cfg["chat_path"]
-        # Re-point the watchdog observer at the new directories
+        # Re-point the watchdog observer at the new directory
         try:
             mu._start_log_observer()
         except Exception:
@@ -4223,7 +4230,6 @@ class MainUISettings:
         # Reset snapshot so APPLY goes back to grayed-out
         self._snap = {
             "log":   self.pv.get(),
-            "chat":  self.cpv.get(),
             "alpha": self.av.get(),
             "tax":   self.tv.get(),
             "theme": self._theme_var.get(),
@@ -4478,8 +4484,11 @@ class MainUI:
         self._dx = self._dy = 0
         self._rw = self._rh = self._rx = self._ry = self._wx = self._wy = 0
         self._last_clipboard  = ""  # shared across all CharacterWindows — first to see a paste wins
+        self._clip_job        = None   # after() id for _poll_clipboard
 
         self._scan_job       = None
+        self._scan_map_cache = None   # shared scan_logs() result (see _scan_map)
+        self._scan_map_ts    = 0.0
         self._is_collapsed   = False
         self._full_height    = 0
         self._dragging       = False
@@ -4502,6 +4511,7 @@ class MainUI:
         self._scan()
         self._health_check()
         self._auto_scan()
+        self._poll_clipboard()
         self._start_log_observer()
 
         if _TRAY_OK:
@@ -4511,8 +4521,23 @@ class MainUI:
         self.root.mainloop()
 
     # ── Scan logs — spawn a CharacterWindow for every new character ───
+    # Résultat de scan_logs() partagé par toutes les fenêtres de personnage.
+    # Sans ce cache, chaque CharacterWindow parcourait l'arbre Gamelogs pour son
+    # propre contrôle de rotation toutes les 5 s — N parcours complets au lieu d'un.
+    def _scan_map(self, max_age=5.0):
+        now = time.monotonic()
+        if self._scan_map_cache is not None and (now - self._scan_map_ts) < max_age:
+            return self._scan_map_cache
+        try:
+            self._scan_map_cache = scan_logs(self.cfg.get("log_path", DEF_PATH))
+        except Exception:
+            if self._scan_map_cache is None:
+                self._scan_map_cache = {}
+        self._scan_map_ts = now
+        return self._scan_map_cache
+
     def _scan(self):
-        cf = scan_logs(self.cfg.get("log_path", DEF_PATH))
+        cf = self._scan_map()
         char_map = self.cfg.setdefault("chars", {})
         changed = False
 
@@ -4623,7 +4648,7 @@ class MainUI:
 
     # ── Event-driven log watching (optional; falls back to timer polling) ──
     def _start_log_observer(self):
-        """Watch the gamelog + chatlog dirs so reads fire on real I/O.
+        """Watch the gamelog dir so reads fire on real I/O.
         No-op (pure polling) when the watchdog package isn't installed."""
         obs = getattr(self, "_log_observer", None)
         if obs is not None:
@@ -4638,7 +4663,7 @@ class MainUI:
             handler = _LogEventHandler(self)
             obs = Observer()
             seen = set()
-            for d in (self.cfg.get("log_path", DEF_PATH), self.cfg.get("chat_path", DEF_CHAT)):
+            for d in (self.cfg.get("log_path", DEF_PATH),):
                 if d and os.path.isdir(d) and os.path.normcase(d) not in seen:
                     obs.schedule(handler, d, recursive=False)
                     seen.add(os.path.normcase(d))
@@ -5013,6 +5038,40 @@ class MainUI:
         except Exception:
             pass
 
+    # ── Clipboard / loot polling (one read for the whole fleet) ──────
+    def _poll_clipboard(self):
+        """Read the Windows clipboard ONCE per tick and offer it to the fleet.
+
+        Each CharacterWindow used to call pyperclip.paste() from its own _tick,
+        so N characters meant N clipboard opens every poll interval — all on the
+        Tk thread, and each one takes the global clipboard lock, contending with
+        every other app trying to copy. The dedupe tracker (_last_clipboard) was
+        already shared here; now the read itself is too.
+        """
+        if _CLIP_OK and self._windows:
+            try:
+                content = pyperclip.paste()
+            except Exception:
+                content = None
+            if content and "\t" in content and content != self._last_clipboard:
+                # Hand it to the first eligible window. If none takes it (none
+                # running, or the only candidate is mid-lookup), _last_clipboard
+                # stays put so the paste is retried on a later tick.
+                for win in list(self._windows.values()):
+                    try:
+                        if win._accept_clipboard(content):
+                            self._last_clipboard = content
+                            break
+                    except Exception:
+                        pass
+        # Read poll_ms live: the Settings dialog writes it straight into the
+        # shared cfg dict, so a value cached at construction would go stale.
+        try:
+            delay = max(100, int(self.cfg.get("poll_ms", DEF_POLL)))
+        except Exception:
+            delay = DEF_POLL
+        self._clip_job = self.root.after(delay, self._poll_clipboard)
+
     # ── Live stats update + frozen detection ─────────────────────────
     def _lset(self, lbl, text=None, fg=None):
         """Update a label only when its value changed.
@@ -5331,6 +5390,9 @@ class MainUI:
         if self._scan_job:
             self.root.after_cancel(self._scan_job)
             self._scan_job = None
+        if self._clip_job:
+            self.root.after_cancel(self._clip_job)
+            self._clip_job = None
         obs = getattr(self, "_log_observer", None)
         if obs is not None:
             try:
