@@ -1,4 +1,19 @@
-# -*- coding: utf-8 -*-
+﻿# -*- coding: utf-8 -*-
+# =============================================================================
+# EVE RATTING — tableau de bord PvE pour EVE Online
+# =============================================================================
+# L'app ne lit QUE les fichiers que le client écrit lui-même sur le disque
+# (dossier Gamelogs). Pas de lecture mémoire, pas de capture réseau, pas de clé
+# API : c'est ce qui la garde conforme à l'EULA, et c'est la contrainte qui
+# explique presque toute l'architecture ci-dessous. Tout part de lignes de texte
+# horodatées qu'il faut suivre en continu et interpréter au regex — d'où les
+# lecteurs incrémentiels, les états dérivés qu'on ne peut jamais interroger
+# directement, et le soin mis à ne rien perdre entre deux lectures.
+#
+# Le tout tient dans un seul fichier volontairement : l'app est distribuée en
+# .exe PyInstaller à des joueurs qui n'ont pas Python, et un fichier unique rend
+# le build et le partage triviaux.
+# =============================================================================
 import sys
 import tkinter as tk
 from tkinter import ttk, font as tkfont
@@ -6,29 +21,56 @@ import os, re, json, time, threading, urllib.request, traceback
 from datetime import datetime, timedelta, timezone
 from collections import deque
 
+# Sous pythonw.exe (mode fenêtre, sans console) sys.stdout vaut None : sans ce
+# test, l'exécutable livré planterait dès la première ligne. L'UTF-8 est imposé
+# parce que les noms de PNJ et les libellés d'alerte contiennent des symboles
+# (étoiles, flèches, crâne) que la console cp1252 refuse d'encoder.
 if sys.stdout is not None:
     sys.stdout.reconfigure(encoding='utf-8')
 
-# -- Dependency Check with Logging --
+# ── Dépendances optionnelles ─────────────────────────────────────────
+# Chacune apporte un confort, aucune n'est vitale : l'app doit démarrer et
+# suivre l'ISK même si toutes manquent. Les drapeaux _*_OK gardent ensuite
+# chaque fonctionnalité une par une, plutôt que de faire échouer l'import.
 _TRAY_OK  = False
 _CLIP_OK  = False
-_LOOT_SPIN = ("◐", "◓", "◑", "◒")   # spinner frames for clipboard loading indicator
+# Verrou de presse-papiers : quand il est armé, PLUS AUCUNE lecture n'est faite.
+# Le joueur l'arme le temps de copier autre chose que du butin (une cargaison à
+# estimer sur un site externe, une fenêtre de contrat, une ligne de marché) —
+# tout texte tabulé serait sinon compté comme du loot.
+# Volontairement au niveau module, et non attribut de MainUI : les DEUX lecteurs
+# doivent le consulter, et l'un d'eux (CharacterWindow._check_clipboard) tourne
+# justement dans le cas où _main_ui vaut None.
+# Jamais persisté : l'app démarre toujours déverrouillée, pour qu'un verrou
+# oublié meure avec le processus au lieu de coûter une soirée de suivi.
+_CLIP_LOCK = False
+_LOOT_SPIN = ("◐", "◓", "◑", "◒")   # frames du spinner pendant l'estimation du loot
+# Sentinelle distincte de None : _cset doit pouvoir mémoriser une valeur None
+# sans la confondre avec « rien encore en cache ».
+_UNSET = object()
 
 try:
     import pyperclip
     _CLIP_OK = True
 except ImportError:
+    # Absence normale, pas une panne : on perd seulement l'estimation du loot.
+    # NE PAS remplacer par _log_exc() — il est défini ~200 lignes plus bas, donc
+    # l'appeler ici lèverait un NameError et l'app ne démarrerait pas du tout.
     pass
 
 try:
     import pystray
     from PIL import Image, ImageDraw, ImageTk
     _TRAY_OK = True
-except ImportError as e:
+except ImportError:
+    # Idem : sans pystray/Pillow on perd l'icône de zone de notification.
+    # Même interdiction d'appeler _log_exc ici (voir juste au-dessus).
     pass
 
-# Optional: event-driven log watching. Falls back to timer polling when absent,
-# so the pre-built .exe (no watchdog bundled) behaves exactly as before.
+# Lecture des logs pilotée par événement plutôt que par minuterie : le sondage
+# fixe réveillait le thread UI quatre fois par seconde pour rien la plupart du
+# temps. Optionnel parce que l'.exe déjà distribué n'embarque pas watchdog —
+# sans lui on retombe sur le sondage, donc l'ancien binaire est inchangé.
 try:
     from watchdog.observers import Observer
     from watchdog.events import FileSystemEventHandler
@@ -36,49 +78,67 @@ try:
 except ImportError:
     _WATCHDOG_OK = False
     Observer = None
-    class FileSystemEventHandler:   # fallback base so _LogEventHandler still defines
+    # Classe de repli : _LogEventHandler hérite d'elle plus bas, donc sans ce
+    # stub le fichier ne serait même pas importable quand watchdog manque.
+    class FileSystemEventHandler:
         pass
 
-# Optional: audio EWAR alerts (winsound is Windows-only stdlib)
+# Bips d'alerte EWAR. winsound est dans la stdlib mais uniquement sous Windows :
+# le try préserve la compatibilité Linux/Proton, où l'app tourne aussi.
 try:
     import winsound
     _SND_OK = True
 except ImportError:
     _SND_OK = False
 
-# ── Colors ───────────────────────────────────────────────────────────
-BG       = "#080808"    # Main background (deep carbon)
-BG_P     = "#121212"    # Panel background
-BG_H     = "#1a1a1a"    # Header background
-BG_C     = "#080808"    # Combobox/field background
-BG_POP   = "#121212"    # Popup background
-BD       = "#2a2a2a"    # Standard border
-BDG      = "#333333"    # Highlight border
-T0       = "#8b9fa9"    # Primary text highlight (EVE UI blue/grey)
-T1       = "#6a7a85"    # Secondary text highlight
-TB       = "#e5e5e5"    # Base text
-TD       = "#777777"    # Dim text
-CD       = "#8b9fa9"    # DPS / generic highlight
-CR       = "#cc3325"    # Red / DPS In
-CG       = "#d4b45d"    # Gold / Bounties / Kills
-CI       = "#55a34f"    # Green / Net ISK
-CT       = "#c45b47"    # Taxes
-CK       = "#896a9e"    # Pending
-CW       = "#c48b47"    # Warning
-CM       = "#777777"    # Muted
-CA       = "#55a34f"    # Active / Play
-CP       = "#b89645"    # Paused
-CS       = "#cc3325"    # Stop / Clear
-CH       = "#5c7b8c"    # History
-C_DETACH = "#8b9fa9"    # Detach button
-C_MSN    = "#5b9bd5"    # Mission tracker accent
-C_ALERT  = "#e07040"    # Alert / danger accent
-C_ESCAL  = "#d4b45d"    # Escalation highlight
-C_ANOM   = "#5b8fa8"    # Anomaly tracker accent
-C_EWAR   = "#ff6b6b"    # EWAR alert (scram/web) — soft red
+# ── Palette ──────────────────────────────────────────────────────────
+# Volontairement très sombre : l'app se pose par-dessus EVE, et un fond clair
+# éblouirait le joueur en pleine session nocturne. Les tons repris de l'UI du jeu
+# évitent aussi que la fenêtre paraisse étrangère au client.
+# Ces noms sont RÉASSIGNÉS à chaud par apply_theme_colors() à chaque changement
+# de thème : d'où des globales plutôt qu'un dictionnaire, puisque tout le code de
+# construction des widgets les lit directement.
+BG       = "#080808"    # Fond principal (carbone profond)
+BG_P     = "#121212"    # Fond de panneau
+BG_H     = "#1a1a1a"    # Fond d'en-tête
+BG_C     = "#080808"    # Fond des champs et combos
+BG_POP   = "#121212"    # Fond des popups
+BD       = "#2a2a2a"    # Bordure standard
+BDG      = "#333333"    # Bordure de survol / focus
+T0       = "#8b9fa9"    # Texte accentué (bleu-gris de l'UI EVE)
+T1       = "#6a7a85"    # Texte accentué secondaire
+TB       = "#e5e5e5"    # Texte de base
+TD       = "#777777"    # Texte atténué
+# Couleurs sémantiques : chacune porte un SENS, pas juste une teinte. Le joueur
+# lit la fenêtre du coin de l'œil pendant un combat, donc la couleur doit
+# suffire à comprendre sans lire — vert = ce qui rentre, rouge = ce qui menace.
+CD       = "#8b9fa9"    # DPS sortant / accent générique
+CR       = "#cc3325"    # DPS entrant — rouge, c'est ce qui vous tue
+CG       = "#d4b45d"    # Bounties et kills — l'or du gain brut
+CI       = "#55a34f"    # ISK net — vert, le chiffre qu'on vient chercher
+CT       = "#c45b47"    # Taxes — rougeâtre, ce que la corpo prélève
+CK       = "#896a9e"    # État transitoire (calcul en cours)
+CW       = "#c48b47"    # Avertissement
+CM       = "#777777"    # Valeur absente ou inactive
+CA       = "#55a34f"    # Session active (Play)
+CP       = "#b89645"    # Session en pause
+CS       = "#cc3325"    # Stop / Effacer — actions destructrices
+CH       = "#5c7b8c"    # Historique
+C_DETACH = "#8b9fa9"    # Bouton de détachement de panneau
+C_MSN    = "#5b9bd5"    # Accent du suivi de mission
+C_ALERT  = "#e07040"    # Accent d'alerte / danger
+C_ESCAL  = "#d4b45d"    # Escalade détectée
+C_ANOM   = "#5b8fa8"    # Accent du suivi d'anomalies
+C_EWAR   = "#ff6b6b"    # Alerte EWAR (scram/web) — rouge doux
 
-# ── Themes ───────────────────────────────────────────────────────────
-# Éclaircit une couleur hex en ajoutant amt à chaque canal
+# ── Thèmes ───────────────────────────────────────────────────────────
+# Les trois helpers ci-dessous existent pour qu'un thème se décrive avec DEUX
+# couleurs seulement (un fond et un accent) au lieu des 28 clés d'une palette
+# complète. Ajouter une faction devient une ligne, et les rapports de contraste
+# restent cohérents d'un thème à l'autre puisqu'ils sont calculés, pas choisis.
+
+# Éclaircit en ajoutant une constante à chaque canal — additif plutôt que
+# multiplicatif, sinon un fond quasi noir (#080808) resterait noir.
 def _lighten(hx, amt):
     h = hx.lstrip('#')
     r = min(255, int(h[0:2], 16) + amt)
@@ -86,7 +146,8 @@ def _lighten(hx, amt):
     b = min(255, int(h[4:6], 16) + amt)
     return f"#{r:02x}{g:02x}{b:02x}"
 
-# Assombrit une couleur hex par facteur multiplicatif
+# Assombrit par facteur : ici le multiplicatif est le bon choix, il préserve la
+# teinte de l'accent au lieu de la tirer vers le gris.
 def _dim(hx, factor=0.6):
     h = hx.lstrip('#')
     r = int(int(h[0:2], 16) * factor)
@@ -94,7 +155,9 @@ def _dim(hx, factor=0.6):
     b = int(int(h[4:6], 16) * factor)
     return f"#{r:02x}{g:02x}{b:02x}"
 
-# Mélange deux couleurs hex avec interpolation linéaire
+# Mélange linéaire de deux teintes : sert à teinter une couleur fonctionnelle
+# (historique, mission, anomalie) vers l'accent du thème, pour qu'elle reste
+# reconnaissable tout en appartenant visuellement à la palette choisie.
 def _blend(h1, h2, t=0.5):
     a = h1.lstrip('#')
     b = h2.lstrip('#')
@@ -103,7 +166,10 @@ def _blend(h1, h2, t=0.5):
     bl = int(int(a[4:6], 16) * (1 - t) + int(b[4:6], 16) * t)
     return f"#{min(255,r):02x}{min(255,g):02x}{min(255,bl):02x}"
 
-# Génère une palette complète depuis une couleur de base et un accent
+# Déploie les deux couleurs d'une faction en palette complète.
+# Les couleurs de STATUT (rouge de danger, vert du gain, or des bounties) sont
+# volontairement figées et non dérivées de l'accent : leur rôle est d'être lues
+# instantanément, et elles perdraient ce sens si chaque thème les repeignait.
 def _gen_theme(base, accent):
     return {
         "BG": base, "BG_P": _lighten(base, 10), "BG_H": _lighten(base, 18),
@@ -161,7 +227,13 @@ THEMES = {
 
 THEME_NAMES = list(THEMES.keys())
 
-# Applique un thème nommé aux variables globales de couleur
+# Réécrit les globales de couleur en place. C'est un effet de bord assumé :
+# les widgets Tk gardent la couleur qu'on leur a passée à la construction, donc
+# changer de thème demande de repeindre chaque widget un par un (voir
+# _apply_theme_live). Passer par des globales permet à ce repeignage de lire
+# simplement la nouvelle valeur, sans trimballer un objet palette partout.
+# Un nom inconnu retombe sur le thème par défaut plutôt que de lever : la config
+# peut venir d'une version antérieure où le thème existait encore.
 def apply_theme_colors(name):
     global BG, BG_P, BG_H, BG_C, BG_POP, BD, BDG
     global T0, T1, TB, TD, CD, CR, CG, CI, CT, CK, CW, CM
@@ -197,38 +269,96 @@ def apply_theme_colors(name):
     C_ESCAL = t["C_ESCAL"]
     C_ANOM = t["C_ANOM"]
 
-# ── Paths & defaults ─────────────────────────────────────────────────
+# ── Chemins et valeurs par défaut ────────────────────────────────────
+# Sous PyInstaller, __file__ pointe dans le dossier temporaire d'extraction qui
+# disparaît à la fermeture : config et historique y seraient perdus à chaque
+# lancement. On ancre donc tout à côté de l'exécutable réel.
 if getattr(sys, 'frozen', False):
     _BASE = os.path.dirname(sys.executable)
 else:
     _BASE = os.path.dirname(os.path.abspath(__file__))
 
+# Quatre fichiers distincts plutôt qu'un seul : ils n'ont ni la même durée de
+# vie ni le même coût. La config change à chaque geste de l'utilisateur,
+# l'historique ne fait que grandir, et les deux caches ESI sont jetables — on
+# peut les supprimer sans rien perdre, ils se reconstruiront tout seuls.
 CONFIG_FILE  = os.path.join(_BASE, "ratting_config.json")
 HISTORY_FILE = os.path.join(_BASE, "ratting_history.json")
 PRICE_CACHE  = os.path.join(_BASE, "ratting_prices.json")
 NAMEID_CACHE = os.path.join(_BASE, "ratting_nameids.json")
 
-# ESI politely requests a descriptive User-Agent; anonymous requests get throttled/blocked.
+# ── Journal de débogage ──────────────────────────────────────────────
+# Ce fichier avale volontairement ~100 exceptions (une fenêtre détruite en
+# plein tick ne doit pas tuer l'app), mais un `except: pass` muet rend tout
+# diagnostic impossible sur la machine de l'utilisateur. _log_exc() conserve
+# exactement ce comportement — l'exception reste avalée — et se contente
+# d'écrire la trace dans ratting_debug.log QUAND le debug est actif.
+# Désactivé : un simple test booléen, rien n'est écrit ni formaté.
+# Activation : variable d'environnement EVE_RATTING_DEBUG=1, ou "debug_log":
+# true dans ratting_config.json.
+DEBUG_LOG_FILE = os.path.join(_BASE, "ratting_debug.log")
+DEBUG_LOG_MAX  = 512 * 1024          # octets — au-delà, le fichier repart à zéro
+_DEBUG_ON  = os.environ.get("EVE_RATTING_DEBUG", "") not in ("", "0")
+_LOG_LOCK  = threading.Lock()
+
+def _log_exc(context=""):
+    """Consigne l'exception en cours de traitement, puis la laisse être avalée.
+
+    Le contrat est important : cette fonction ne relance JAMAIS et ne change
+    jamais le flot d'exécution. Elle s'insère dans des `except` déjà existants
+    sans rien modifier au comportement de l'app.
+    """
+    if not _DEBUG_ON:
+        return
+    try:
+        with _LOG_LOCK:
+            try:
+                if os.path.getsize(DEBUG_LOG_FILE) > DEBUG_LOG_MAX:
+                    os.remove(DEBUG_LOG_FILE)
+            except OSError:
+                pass
+            with open(DEBUG_LOG_FILE, "a", encoding="utf-8") as f:
+                f.write("[%s] %s\n" % (
+                    datetime.now().strftime("%Y-%m-%d %H:%M:%S"), context))
+                f.write(traceback.format_exc())
+                f.write("\n")
+    except Exception:
+        # Journaliser ne doit jamais devenir la cause d'une panne : si l'écriture
+        # échoue (disque plein, dossier en lecture seule), on abandonne en
+        # silence plutôt que de faire remonter une exception depuis un `except`.
+        pass
+
+# CCP demande un User-Agent descriptif sur l'ESI : les requêtes anonymes se font
+# limiter puis bloquer, ce qui casserait silencieusement l'estimation du loot.
 _ESI_UA = "Eve-Ratting/1.0 (+https://github.com/psychojf/Eve-Ratting)"
 
-# Serializes the shared market-price cache download/write across all CharacterWindows,
-# so only one thread fetches ESI and writes ratting_prices.json (the rest load what it wrote).
+# Chaque CharacterWindow lance son propre thread de prix au démarrage. Sans ce
+# verrou, cinq personnages = cinq téléchargements ESI simultanés du même
+# catalogue et cinq écritures concurrentes sur ratting_prices.json, qui finissait
+# tronqué. Ici le premier thread télécharge, les autres attendent puis relisent.
 _PRICE_LOCK = threading.Lock()
-# Guards the shared name→type_id cache file against concurrent loot-thread writes.
+# Même problème sur le cache nom→type_id, écrit par les threads de loot de
+# toutes les fenêtres : le verrou permet la fusion lecture-modification-écriture
+# sans qu'un thread écrase les identifiants qu'un autre vient de résoudre.
 _NAMEID_LOCK = threading.Lock()
 
 def _find_eve_log_path(subdir):
-    """Return the first existing EVE log path across Windows, Linux native, and Linux/Proton."""
+    """Premier chemin de logs EVE existant, selon l'installation.
+
+    EVE tourne aussi sous Linux via Proton, où le client écrit dans une
+    arborescence Wine complètement différente. Plutôt que de demander le chemin
+    à l'utilisateur au premier lancement, on teste les emplacements connus.
+    """
     candidates = [
-        # Windows / macOS native
+        # Windows / macOS natif
         os.path.join(os.path.expanduser("~"), "Documents", "EVE", "logs", subdir),
-        # Linux native client
+        # Client Linux natif
         os.path.join(os.path.expanduser("~"), ".eve", "sharedcache", "tq", "logs", subdir),
-        # Linux Steam / Proton (default Steam library)
+        # Steam / Proton (bibliothèque Steam par défaut)
         os.path.join(os.path.expanduser("~"), ".local", "share", "Steam",
                      "steamapps", "compatdata", "8500", "pfx", "drive_c",
                      "users", "steamuser", "My Documents", "EVE", "logs", subdir),
-        # Linux Steam with custom library on second drive
+        # Steam avec bibliothèque déportée sur un second disque
         os.path.join("/mnt", "ssd", "SteamLibrary", "steamapps", "compatdata",
                      "8500", "pfx", "drive_c", "users", "steamuser",
                      "My Documents", "EVE", "logs", subdir),
@@ -236,58 +366,95 @@ def _find_eve_log_path(subdir):
     for p in candidates:
         if os.path.isdir(p):
             return p
-    return candidates[0]  # fall back to Windows default even if missing
+    # Rien trouvé : on renvoie quand même le chemin Windows. L'app démarre, la
+    # liste de personnages reste vide, et l'utilisateur peut corriger le chemin
+    # dans les réglages — préférable à un plantage au lancement.
+    return candidates[0]
 
 DEF_PATH     = _find_eve_log_path("Gamelogs")
-DEF_POLL     = 250
-DEF_TAX      = 12.5
-DEF_ALPHA    = 0.85  # Default set to 85%
-DPS_W        = 15
-WIN_W        = 290
-MAX_ALERTS   = 5     # Max mission/alert feed entries to display
-ANOM_GAP     = 45    # Seconds of no combat = site boundary (warp gap)
-BACKFILL_MINS = 15   # On Play, scan gamelog for bounties from last N minutes
-DPS_GRAPH_W  = 120   # Fenêtre du graphique d'historique DPS (en secondes)
-DPS_GRAPH_H  = 50    # Hauteur du graphique intégré en pixels
+DEF_POLL     = 250   # ms — assez rapide pour que le DPS paraisse continu, assez
+                     # lent pour ne pas saturer le thread UI avec N personnages
+DEF_TAX      = 12.5  # taux de taxe corpo le plus courant en nullsec
+DEF_ALPHA    = 0.85  # légère transparence par défaut : on doit deviner le jeu
+                     # derrière la fenêtre sans perdre la lisibilité
+DPS_W        = 15    # s — fenêtre glissante du DPS. Trop court, le chiffre
+                     # saute entre deux salves ; trop long, il ne réagit plus
+WIN_W        = 290   # px — largeur pensée pour tenir dans un coin d'écran
+MAX_ALERTS   = 5     # au-delà, le fil d'alertes fait grandir la fenêtre et
+                     # noie l'information importante sous l'ancienne
+ANOM_GAP     = 45    # s sans combat = changement de site. Couvre un warp et
+                     # l'approche, sans couper une pause de rechargement
+BACKFILL_MINS = 15   # au Play, on rattrape les bounties déjà tombées : le
+                     # joueur lance souvent l'app après avoir commencé à ratter
+MAX_HISTORY  = 1000  # sessions gardées dans ratting_history.json ; le fichier
+                     # grossissait sans limite alors que la fenêtre n'en montre
+                     # que 100, filtrées par personnage
+DPS_GRAPH_W  = 120   # s — profondeur d'historique du graphique DPS
+DPS_GRAPH_H  = 50    # px — hauteur du graphique intégré
 
-# ── DPS overlay transparency ─────────────────────────────────────────
-# Color-key: any widget painted this exact color renders fully transparent
-# under Windows -transparentcolor, so only text/graph lines show over EVE.
-# Dark so anti-alias fringe on text edges blends into EVE's space backdrop.
+# ── Transparence de l'overlay DPS ────────────────────────────────────
+# Couleur-clé : sous Windows, -transparentcolor rend totalement invisible tout
+# pixel de cette teinte exacte. C'est ce qui permet à l'overlay de n'afficher que
+# les chiffres, sans cadre, comme la fenêtre « messages » d'EVE.
+# Presque noir plutôt que noir pur : le lissage des polices crée un halo autour
+# des lettres, et un ton sombre le fait disparaître dans le fond spatial du jeu.
 OVERLAY_KEY     = "#010101"
-# Solid backdrop shown ONLY while repositioning (move mode) so the whole
-# frame is grabbable in every view; reverts to OVERLAY_KEY once placed.
+# Fond opaque affiché UNIQUEMENT pendant le repositionnement : sans lui, il n'y
+# aurait presque rien à attraper à la souris dans la vue « chiffres seuls ».
+# Retour à OVERLAY_KEY dès que l'overlay est posé.
 OVERLAY_MOVE_BG = "#0d0d12"
 
-# ── Log filename / header patterns ───────────────────────────────────
-RE_CF = re.compile(r'^(\d{8})_(\d{6})_(\d+)\.txt$')           # combat log filename
-RE_LI = re.compile(r'Listener:\s*(.+)',              re.I)     # character name header
-RE_TS = re.compile(r'\[\s*(\d{4}\.\d{2}\.\d{2}\s+\d{2}:\d{2}:\d{2})\s*\]')  # timestamp
+# ── Motifs de nom de fichier et d'en-tête ────────────────────────────
+# EVE nomme ses gamelogs <date>_<heure>_<charID>.txt. Le charID final est la clé
+# de toute l'app multi-comptes : c'est le seul identifiant stable pour rattacher
+# un fichier à un personnage — le nom affiché, lui, peut changer.
+RE_CF = re.compile(r'^(\d{8})_(\d{6})_(\d+)\.txt$')
+# Le nom lisible n'apparaît que dans l'en-tête « Listener: », d'où une lecture
+# des premières lignes du fichier pour l'obtenir (voir rlisten).
+RE_LI = re.compile(r'Listener:\s*(.+)',              re.I)
+# Horodatage préfixant chaque ligne. Utilisé surtout par le rattrapage, qui doit
+# savoir DE QUAND date une bounty pour décider s'il la recompte.
+RE_TS = re.compile(r'\[\s*(\d{4}\.\d{2}\.\d{2}\s+\d{2}:\d{2}:\d{2})\s*\]')
+# Bandeau de début de fichier : reconnu pour être ignoré, pas pour être exploité.
 RE_SS = re.compile(r'Session\s+Started:\s*(\d{4}\.\d{2}\.\d{2}\s+\d{2}:\d{2}:\d{2})', re.I)
 
-# ── Combat regex patterns ────────────────────────────────────────────
-# HTML groups 1-3, plain groups 4-6: amt, name, suffix
+# ── Motifs de combat ─────────────────────────────────────────────────
+# EVE écrit les lignes de combat en DEUX formats selon les réglages du client :
+# soit truffées de balises HTML de couleur, soit en texte brut. D'où les motifs
+# en alternance — groupes 1-3 pour la variante HTML, 4-6 pour la variante
+# brute — et le `m.group(1) or m.group(4)` systématique côté appelant.
+# Les faire cohabiter dans un seul motif évite de tester deux regex par ligne
+# sur un flux qui peut dépasser la centaine de lignes par seconde en combat.
 
-RE_TO = re.compile(                                            # outgoing damage
+RE_TO = re.compile(                                            # dégâts sortants
     r'\(combat\)\s*(?:<[^>]+>)*<b>(\d+)</b>.*?\bto\b'
     r'.*?<b>(?:<[^>]+>)?([\w\s\'-]+?)</b>.*?-\s*(.+)$'
     r'|\(combat\)\s+(\d+)\s+to\s+([\w\s\'-]+?)\s+-\s+(.+)$',
     re.I
 )
-RE_FR = re.compile(                                            # incoming damage
+RE_FR = re.compile(                                            # dégâts entrants
     r'\(combat\)\s*(?:<[^>]+>)*<b>(\d+)</b>.*?\bfrom\b'
     r'.*?<b>(?:<[^>]+>)?([\w\s\'-]+?)</b>.*?-\s*(.+)$'
     r'|\(combat\)\s+(\d+)\s+from\s+([\w\s\'-]+?)\s+-\s+(.+)$',
     re.I
 )
-RE_NM = re.compile(r'\(combat\)\s*([\w\s\'-]+?)\s+misses\s+you\s+completely',   re.I)  # NPC miss
-RE_DM = re.compile(r'\(combat\)\s+Your\s+(.+?)\s+misses\s+([\w\s\'-]+?)\s+completely', re.I)  # drone miss
+# Les tirs manqués ne changent ni le DPS ni l'ISK, mais ils prouvent qu'un
+# combat est EN COURS : sans eux, une passe où l'on ne touche rien ressemblerait
+# à un trou de combat et clôturerait l'anomalie à tort.
+RE_NM = re.compile(r'\(combat\)\s*([\w\s\'-]+?)\s+misses\s+you\s+completely',   re.I)  # PNJ qui rate
+RE_DM = re.compile(r'\(combat\)\s+Your\s+(.+?)\s+misses\s+([\w\s\'-]+?)\s+completely', re.I)  # drone qui rate
 
-# ── Bounty payout pattern ────────────────────────────────────────────
-# Handles both plain and HTML-tagged bounty lines
+# ── Motif de paiement de bounty ──────────────────────────────────────
+# Seule source de vérité sur l'ISK gagné : le client n'expose le total nulle
+# part ailleurs sur le disque. Le montant est capturé en tolérant espaces,
+# virgules et points, car le séparateur de milliers suit la locale du client.
 RE_BT = re.compile(r'\(bounty\)\s*(?:<[^>]+>)*([\d\s,.]+)\s*ISK.*?added\s+to\s+next\s+bounty\s+payout', re.I)
 
-# ── Faction/loot keyword pattern ─────────────────────────────────────
+# ── Mots-clés de loot de faction ─────────────────────────────────────
+# Sert d'aiguillage de prix, pas de reconnaissance d'objet : un item portant un
+# de ces préfixes vaut assez cher pour justifier un appel ESI sur le marché de
+# Jita, alors que le reste se contente du prix moyen déjà en cache. Sans ce tri,
+# une seule cargaison déclencherait des centaines de requêtes.
 RE_FACTION_ITEM = re.compile(
     r'\b(Shadow|Dread|True|Dark|Sentient|Infested|'
     r'Caldari Navy|Amarr Navy|Federation Navy|Republic Fleet|'
@@ -295,60 +462,94 @@ RE_FACTION_ITEM = re.compile(
     re.I
 )
 
-# ── Mission/alert patterns (gamelog) ─────────────────────────────────
+# ── Motifs de mission et d'alerte (gamelog) ──────────────────────────
+# Objectif rempli : le joueur peut rentrer voir l'agent. Signalé parce qu'on le
+# rate facilement quand la fenêtre de mission est fermée pendant le combat.
 RE_OBJ_MET  = re.compile(r'Objective accomplished\.\s*You may now return to your agent\.', re.I)
+# Mission terminée. Alimente le compteur de storyline : EVE en propose une tous
+# les 16 rendus, et rien dans le client ne dit où on en est dans ce cycle.
 RE_MSN_COMP = re.compile(r'You completed mission\s+(\d+)',                                 re.I)
 RE_STAND    = re.compile(r'Your standings with\s+(.*?)\s+have increased by\s+([\d.]+)',    re.I)
+# Apparition d'un PNJ de faction sur la grille : ça vaut cher, et ça tape plus
+# fort — le joueur veut le savoir avant de le découvrir dans son overview.
 RE_FACTION  = re.compile(r'\(combat\).*?\b(Shadow|Dread|True|Dark|Sentient|Infested|Caldari Navy|Amarr Navy)\b\s+([\w\s]+?)\s*-\s*Hits', re.I)
+# Dreadnought : menace mortelle en anomalie, l'alerte doit être immédiate.
 RE_DREAD    = re.compile(r'\(notify\)\s+(.*?)\s*Dreadnought detected',                    re.I)
+# Escalade : le site vient de se prolonger ailleurs, avec une fenêtre de temps
+# limitée pour la suivre. Facile à manquer dans le flot du journal.
 RE_ESCAL    = re.compile(r'A portion of the\s+(.*?)\s+database reveals the potential location', re.I)
 
-# ── EWAR patterns (scram/web) ────────────────────────────────────────
-# Group 1=HTML attacker, 2=plain attacker
+# ── Motifs EWAR (scram / web) ────────────────────────────────────────
+# Les deux événements qui empêchent de FUIR : sans warp, un joueur distrait
+# perd son vaisseau. C'est la seule catégorie d'alerte doublée d'un bip sonore.
+# Groupe 1 = attaquant en HTML, groupe 2 = attaquant en texte brut.
 RE_SCRAM = re.compile(
     r'\(combat\)\s*(?:<[^>]+>)*(?:<b>)?Warp\s+scramble\s+attempt(?:</b>)?'
     r'.*?<b>(?:<[^>]+>)?([\w\s\'-]+)</b>'
     r'|\(combat\)\s+Warp\s+scramble\s+attempt\s+from\s+([\w\s\'-]+?)\s+to\s+you',
     re.I
 )
-# WEB is a GAMELOG (notify) line, like every other (notify) event. It used to
-# be matched only against chatlog lines, which could never fire: chatlog lines
-# look like "[ ts ] Speaker > message" and never carry a "(notify)" tag at all.
-# Tolerates the tagged form too, the way RE_SCRAM does for the sibling EWAR
-# event (the plain form is what real gamelogs show; tags are cheap insurance).
+# Le web arrive dans le GAMELOG, en ligne (notify), comme tous les autres
+# événements de ce type. Il était autrefois cherché dans les chatlogs, où il ne
+# pouvait structurellement jamais correspondre : une ligne de chat s'écrit
+# « [ horodatage ] Locuteur > message » et ne porte aucune balise (notify).
+# La variante balisée est tolérée par symétrie avec RE_SCRAM — seule la forme
+# brute a été observée dans de vrais gamelogs, les balises sont une assurance.
 RE_WEB = re.compile(
     r'\(notify\)\s*(?:<[^>]+>)*(?:<b>)?([\w\s\'-]+?)(?:</b>)?(?:<[^>]+>)*'
     r'\s+has\s+started\s+webifying\s+you',
     re.I
 )
 
-# ── Utility functions ────────────────────────────────────────────────
-# Supprime les balises HTML d'une chaîne
+# ── Fonctions utilitaires ────────────────────────────────────────────
+# Le client peut colorer ses lignes de journal en HTML ; on ne garde que le
+# texte, sinon les noms de PNJ s'afficheraient avec leurs balises dans l'UI.
 def shtml(t): return re.sub(r'<[^>]+>', '', t).strip()
 
-# Parse un entier en ignorant les espaces (ex: "1 234 567" → 1234567)
+# Lit un entier quel que soit le séparateur de milliers du client (« 1 234 567 »,
+# « 1,234,567 », « 1.234.567 » selon la locale) — d'où le nettoyage préalable
+# plutôt qu'un int() direct.
 def pnum(s):
+    # Fonction TOTALE par conception : les appelants traitent 0 comme « pas de
+    # nombre exploitable » et se rabattent sur autre chose.
+    # Elle levait autrefois ValueError sur du texte non numérique, ce qui tuait
+    # net le thread d'estimation du loot (voir _process_loot_copy) : n'importe
+    # quel presse-papiers contenant une tabulation lui parvient — une ligne de
+    # tableur, un tableau copié d'une page web, du code indenté.
     cleaned = re.sub(r'[\s,.]+', '', s.strip())
-    return int(cleaned) if cleaned else 0
+    if not cleaned:
+        return 0
+    try:
+        return int(cleaned)
+    except ValueError:
+        return 0
 
-# Formate un montant ISK en notation courte (K/M/B)
+# Notation courte : les montants dépassent vite le milliard, et une colonne de
+# chiffres bruts serait illisible du coin de l'œil pendant un combat.
 def fisk(v):
     if v >= 1e9: return f"{v/1e9:.2f}B"
     if v >= 1e6: return f"{v/1e6:.2f}M"
     if v >= 1e3: return f"{v/1e3:.1f}K"
     return f"{v:,.0f}"
 
-# Formate un montant ISK avec séparateurs d'espaces
+# Forme longue, réservée au détail où le joueur veut le montant exact ; l'espace
+# comme séparateur reprend la convention d'affichage du client EVE.
 def fiskf(v): return f"{int(v):,}".replace(",", " ")
 
-# Formate des secondes en durée lisible (HH:MM:SS)
+# Toujours en HH:MM:SS, même sous l'heure : une largeur de champ constante évite
+# que les colonnes du tableau de flotte ne sautillent à chaque rafraîchissement.
 def fdur(s):
+    # Le max(0) protège d'une durée négative quand l'horloge système recule
+    # (mise à l'heure NTP) entre le début de session et le calcul.
     s = max(0, int(s))
     h, r = divmod(s, 3600)
     m, s2 = divmod(r, 60)
     return f"{h:02d}:{m:02d}:{s2:02d}"
 
-# Extrait l'arme et le type de coup depuis une chaîne de combat
+# La queue d'une ligne de combat porte l'arme et la qualité du coup, séparées
+# par des tirets. Le repli sur « Unknown » évite qu'une ligne au format
+# inattendu (module inconnu, traduction du client) fasse échouer tout le parsing
+# de la ligne alors que les dégâts, eux, ont bien été lus.
 def ptail(t):
     t = shtml(t)
     p = [x.strip() for x in t.split(" - ") if x.strip()]
@@ -359,73 +560,139 @@ def ptail(t):
 # Dessine les polylignes d'historique DPS (OUT/IN) sur un Canvas Tk.
 # Partagé par le panneau DPS détaché et l'overlay DPS autonome.
 def draw_dps_graph(canvas, hist, *, is_detached=False):
-    """Draw OUT/IN DPS history polylines onto `canvas` from a deque of
-    (monotonic_ts, dps_out, dps_in). Caller guarantees canvas exists/viewable."""
+    """Trace les courbes DPS sortant / entrant à partir d'un deque de
+    (horodatage monotone, dps_out, dps_in). L'appelant garantit que le canvas
+    existe et est affichable.
+
+    Met à jour les objets du canvas EN PLACE plutôt que delete("all") suivi
+    d'une recréation à chaque rafraîchissement : reconstruire une polyligne de
+    ~480 points quatre fois par seconde est la cause classique de scintillement
+    sur un canvas Tk, et on dessine ici sur un overlay transparent toujours au
+    premier plan. Les objets ne sont recréés qu'au redimensionnement ou au
+    changement de thème — l'ancienne approche « tout effacer » suivait les
+    couleurs gratuitement, il faut donc désormais le gérer explicitement.
+    """
     w = canvas.winfo_width()
     h = canvas.winfo_height()
+    # Tk renvoie 1x1 tant que le widget n'a pas été disposé : dessiner à ce
+    # moment-là produirait une courbe écrasée qu'il faudrait redessiner juste
+    # après. On attend simplement le prochain rafraîchissement.
     if w < 10 or h < 10:
         return
-    canvas.delete("all")
-    if len(hist) < 2:
-        return
-    now = time.monotonic()
-    cutoff = now - DPS_GRAPH_W
-    pts = [(t, do, di) for t, do, di in hist if t >= cutoff]
-    if len(pts) < 2:
-        return
-    max_dps = max(max(do for _, do, _ in pts), max(di for _, _, di in pts), 100)
-    y_max = max_dps * 1.1
+
     pad_x, pad_y = 2, 3
     gw = w - pad_x * 2
     gh = h - pad_y * 2
-    t_start = cutoff
-    t_span = DPS_GRAPH_W
+    col_out  = CD
+    col_in   = _dim(CR, 0.4)
+    palette  = (col_out, col_in, BD, TD)
+
+    items = getattr(canvas, "_dps_items", None)
+    if (items is None or items["size"] != (w, h)
+            or items["detached"] != is_detached or items["palette"] != palette):
+        canvas.delete("all")
+        items = {"size": (w, h), "detached": is_detached, "palette": palette,
+                 "out": None, "in": None, "label": None, "label_text": None}
+        for frac in (0.25, 0.50, 0.75):
+            gy = pad_y + gh - frac * gh
+            canvas.create_line(pad_x, gy, w - pad_x, gy, fill=BD, dash=(2, 4), tags="grid")
+        # Créés masqués avec des coordonnées bidon : la géométrie réelle est
+        # posée plus bas à chaque rafraîchissement via canvas.coords(). Créer
+        # les objets une seule fois est tout l'intérêt de la manœuvre.
+        items["in"]  = canvas.create_line(0, 0, 0, 0, fill=col_in, width=1,
+                                          smooth=True, tags="line_in", state="hidden")
+        items["out"] = canvas.create_line(0, 0, 0, 0, fill=col_out,
+                                          width=2 if is_detached else 1,
+                                          smooth=True, tags="line_out", state="hidden")
+        if is_detached and h > 40:
+            items["label"] = canvas.create_text(pad_x + 2, pad_y + 2, text="",
+                                                font=("Consolas", 7), fill=TD,
+                                                anchor="nw", tags="label")
+        canvas._dps_items = items
+
+    def _hide_lines():
+        for key in ("out", "in"):
+            if items[key] is not None:
+                canvas.itemconfigure(items[key], state="hidden")
+
+    if len(hist) < 2:
+        _hide_lines()
+        return
+    cutoff = time.monotonic() - DPS_GRAPH_W
+    pts = [(t, do, di) for t, do, di in hist if t >= cutoff]
+    if len(pts) < 2:
+        _hide_lines()
+        return
+
+    # Échelle automatique, avec un plancher à 100 : sans lui, un DPS résiduel de
+    # 3 remplirait toute la hauteur et donnerait l'illusion d'un gros combat.
+    max_dps = max(max(do for _, do, _ in pts), max(di for _, _, di in pts), 100)
+    # 10 % de marge en haut pour que le pic ne colle pas au bord du cadre.
+    y_max = max_dps * 1.1
+
     def _px(t, v):
-        x = pad_x + ((t - t_start) / t_span) * gw
+        x = pad_x + ((t - cutoff) / DPS_GRAPH_W) * gw
         y = pad_y + gh - (v / y_max) * gh
         return x, y
-    for frac in (0.25, 0.50, 0.75):
-        gy = pad_y + gh - frac * gh
-        canvas.create_line(pad_x, gy, w - pad_x, gy, fill=BD, dash=(2, 4), tags="grid")
-    coords_out = []
-    coords_in = []
+
+    coords_out, coords_in = [], []
+    any_out = any_in = False
     for t, do, di in pts:
         ox, oy = _px(t, do)
         ix, iy = _px(t, di)
         coords_out.extend([ox, oy])
         coords_in.extend([ix, iy])
-    if any(v > 0 for _, _, v in pts):
-        canvas.create_line(*coords_in, fill=_dim(CR, 0.4), width=1, smooth=True, tags="line_in")
-    if any(v > 0 for _, v, _ in pts):
-        canvas.create_line(*coords_out, fill=CD, width=2 if is_detached else 1, smooth=True, tags="line_out")
-    if is_detached and h > 40:
-        canvas.create_text(pad_x + 2, pad_y + 2, text=f"{max_dps:,.0f}",
-                           font=("Consolas", 7), fill=TD, anchor="nw", tags="label")
+        if do > 0: any_out = True
+        if di > 0: any_in = True
 
-# Lit le nom du personnage dans l'en-tête du fichier log
+    for key, coords, visible in (("in", coords_in, any_in), ("out", coords_out, any_out)):
+        item = items[key]
+        if item is None:
+            continue
+        if visible:
+            canvas.coords(item, *coords)
+            canvas.itemconfigure(item, state="normal")
+        else:
+            canvas.itemconfigure(item, state="hidden")
+
+    if items["label"] is not None:
+        txt = f"{max_dps:,.0f}"
+        if txt != items["label_text"]:
+            items["label_text"] = txt
+            canvas.itemconfigure(items["label"], text=txt)
+
+# Le nom du personnage n'existe nulle part ailleurs : le nom de fichier ne porte
+# que son identifiant numérique. Il faut donc ouvrir le log pour l'afficher.
 def rlisten(fp):
     try:
         with open(fp, "r", encoding="utf-8", errors="replace") as f:
+            # On s'arrête après quelques lignes : l'en-tête est en tête de
+            # fichier, et un gamelog de plusieurs heures pèse des mégaoctets
+            # qu'il serait absurde de parcourir pour une seule ligne.
             for i, l in enumerate(f):
                 if i > 15: break
                 m = RE_LI.search(l)
                 if m: return m.group(1).strip()
     except Exception:
-        pass
+        _log_exc("rlisten:506")
     return None
 
-# Scanne récursivement le dossier pour trouver les logs de combat par personnage
+# Point d'entrée de la détection automatique des personnages : c'est en trouvant
+# un gamelog qu'on découvre qu'un pilote existe, sans rien demander au joueur.
 def scan_logs(base):
-    """char_id → path of that character's newest gamelog.
+    """char_id → chemin du gamelog le plus récent de ce personnage.
 
-    os.scandir instead of os.walk + os.path.getmtime: on Windows the DirEntry
-    already carries the metadata from the directory enumeration, so .stat() is
-    free, whereas getmtime() costs one extra syscall per file. EVE never prunes
-    the Gamelogs folder, so that cost grows for the life of the install — and
-    this runs on the Tk thread.
+    os.scandir plutôt que os.walk + os.path.getmtime : sous Windows, l'objet
+    DirEntry porte déjà les métadonnées issues de l'énumération du dossier, donc
+    .stat() est gratuit, là où getmtime() coûte un appel système par fichier.
+    EVE ne purge jamais le dossier Gamelogs, donc ce coût grandit pendant toute
+    la vie de l'installation — et cette fonction tourne sur le thread Tk.
+
+    On ne garde que le fichier le plus récent par personnage : EVE en ouvre un
+    nouveau à chaque session de jeu, et seul le dernier est encore alimenté.
     """
-    r  = {}         # char_id → newest log path
-    mt = {}         # char_id → that path's mtime (avoids re-stat'ing on each compare)
+    r  = {}         # char_id → chemin du log le plus récent
+    mt = {}         # char_id → mtime de ce chemin (évite de re-stat à chaque comparaison)
     if not os.path.isdir(base): return r
     stack = [base]
     while stack:
@@ -446,26 +713,41 @@ def scan_logs(base):
                             r[c]  = e.path
                             mt[c] = fmt
                     except OSError:
+                        # Fichier disparu ou verrouillé entre l'énumération et
+                        # le stat : on l'ignore plutôt que d'interrompre tout le
+                        # balayage et de perdre les autres personnages.
                         continue
         except OSError:
             continue
     return r
 
-# Charge la configuration JSON depuis le disque
+# Une config absente ou corrompue renvoie {} plutôt que de lever : l'app doit
+# démarrer avec ses valeurs par défaut, quitte à perdre les réglages, plutôt que
+# de refuser de s'ouvrir. Tous les lecteurs utilisent .get() avec un défaut.
 def load_config():
     if os.path.exists(CONFIG_FILE):
         try:
             with open(CONFIG_FILE, "r", encoding="utf-8") as f:
-                return json.load(f)
+                cfg = json.load(f)
+            # Deuxième moyen d'activer le journal de débogage, à côté de
+            # EVE_RATTING_DEBUG : dans l'.exe livré, définir une variable
+            # d'environnement est peu commode pour un utilisateur non technique.
+            if cfg.get("debug_log"):
+                global _DEBUG_ON
+                _DEBUG_ON = True
+            return cfg
         except Exception:
-            pass
+            _log_exc("load_config:559")
     return {}
 
-# Écrit un JSON de façon atomique (fichier temporaire + os.replace).
-# open(path, "w") tronque la cible AVANT d'écrire : un crash ou une coupure de
-# courant en plein milieu laissait un ratting_config.json vide — donc toute la
-# config (géométries, sections, réglages par perso) perdue. Le cache de prix et
-# le cache nom→id utilisaient déjà ce motif ; config + historique non.
+# Écriture atomique : fichier temporaire, puis os.replace.
+# open(path, "w") tronque la cible AVANT d'écrire — un plantage ou une coupure
+# de courant en plein milieu laissait un ratting_config.json vide, donc toute la
+# configuration perdue (géométries, sections, réglages par personnage). Le cache
+# de prix et le cache nom→id suivaient déjà ce motif ; la config et l'historique
+# étaient restés en écriture directe.
+# Le fsync force l'écriture physique avant le remplacement : sans lui, os.replace
+# peut être visible sur le disque avant les données elles-mêmes.
 def _atomic_write_json(path, payload, indent=2):
     tmp = path + ".tmp"
     try:
@@ -477,34 +759,52 @@ def _atomic_write_json(path, payload, indent=2):
         return True
     except Exception:
         try:
+            # Ne pas laisser traîner un .tmp partiel : au prochain démarrage il
+            # ressemblerait à un fichier légitime pour qui inspecte le dossier.
             if os.path.exists(tmp):
                 os.remove(tmp)
         except Exception:
-            pass
+            _log_exc("_atomic_write_json:581")
         return False
 
-# Sauvegarde la configuration JSON sur le disque (écriture atomique)
+# Appelée depuis une trentaine d'endroits, souvent en réaction directe à un
+# geste de l'utilisateur (déplacer une fenêtre, replier une section) : c'est
+# précisément pour ça que l'écriture doit être atomique et bon marché.
 def save_config(cfg):
     _atomic_write_json(CONFIG_FILE, cfg)
 
-# Charge l'historique des sessions depuis le disque
+# Comme la config : un historique illisible renvoie une liste vide plutôt que
+# d'empêcher l'app de démarrer — perdre l'historique est ennuyeux, ne pas
+# pouvoir ratter l'est davantage.
 def load_history():
     if os.path.exists(HISTORY_FILE):
         try:
             with open(HISTORY_FILE, "r", encoding="utf-8") as f:
                 return json.load(f)
         except Exception:
-            pass
+            _log_exc("load_history:595")
     return []
 
-# Sauvegarde l'historique des sessions sur le disque (écriture atomique)
+# Sauvegarde de l'historique (écriture atomique).
+# Ne conserve que les MAX_HISTORY entrées les plus récentes : le fichier
+# grossissait sans limite alors que la fenêtre d'historique n'en affiche que
+# 100. Le plafond reste large parce que ce filtrage des 100 se fait APRÈS
+# sélection du personnage : un plafond serré affamerait un pilote peu joué.
 def save_history(entries):
+    if len(entries) > MAX_HISTORY:
+        entries = entries[-MAX_HISTORY:]
     _atomic_write_json(HISTORY_FILE, entries)
 
 # Sauvegarde les données de la session courante dans l'historique
 def save_session(data, char_name, tax_pct):
+    # Rien gagné, rien tiré, rien looté : la session n'apprend rien au joueur et
+    # ne ferait que polluer l'historique. Le cas est fréquent — ouvrir l'app,
+    # regarder, refermer.
     if data.bg <= 0 and data.dd <= 0 and data.loot_val <= 0:
         return
+    # Instantané APLATI plutôt qu'une référence à l'objet Data : la session est
+    # remise à zéro juste après, et l'historique doit rester lisible tel quel
+    # dans le JSON, sans dépendre de la structure interne du code.
     entry = {
         "date":       datetime.now().strftime("%Y-%m-%d %H:%M"),
         "character":  char_name or "Unknown",
@@ -524,6 +824,9 @@ def save_session(data, char_name, tax_pct):
         "missions_done": data.missions_done,
         "last_mission":  data.mission_name or "",
         "sites_cleared": len(data.anom_completed),
+        # Le max(..., 1) évite la division par zéro quand aucun site n'a été
+        # bouclé ; le filtre sur end/start écarte un site encore ouvert, dont la
+        # durée n'a pas de sens.
         "avg_site_time": int(sum(
             max(0, (a["end"] - a["start"]).total_seconds())
             for a in data.anom_completed if a["end"] and a["start"]
@@ -532,16 +835,22 @@ def save_session(data, char_name, tax_pct):
                              / max(len(data.anom_completed), 1)),
         "best_site_isk": max((a["isk"] for a in data.anom_completed), default=0),
     }
+    # Relecture systématique avant l'ajout : plusieurs fenêtres de personnage
+    # peuvent archiver leur session à quelques secondes d'intervalle, et garder
+    # une liste en mémoire ferait perdre l'entrée écrite par la précédente.
     hist = load_history()
     hist.append(entry)
     save_history(hist)
 
 
-# ── Tooltip helpers ──────────────────────────────────────────────────
-# Infobulle statique affichée au survol d'un widget
+# ── Infobulles ───────────────────────────────────────────────────────
+# Infobulle maison plutôt que le tooltip d'un toolkit : les fenêtres de l'app
+# sont en overrideredirect (sans décoration), toujours au premier plan et
+# semi-transparentes, contraintes qu'aucun widget standard ne respecte.
 class Tooltip:
 
-    # Initialise et lie les événements de survol
+    # add="+" pour ne pas écraser les liaisons <Enter>/<Leave> déjà posées sur
+    # le widget — beaucoup portent déjà un survol qui change leur couleur.
     def __init__(self, widget, text):
         self.widget = widget
         self.text = text
@@ -549,14 +858,17 @@ class Tooltip:
         widget.bind("<Enter>", self._show, add="+")
         widget.bind("<Leave>", self._hide, add="+")
 
-    # Affiche l'infobulle sous le widget
+    # Positionnée sous le widget et non sous le curseur : l'infobulle ne doit
+    # jamais recouvrir ce que le joueur vient de survoler.
     def _show(self, e):
         x = self.widget.winfo_rootx() + self.widget.winfo_width() // 2
         y = self.widget.winfo_rooty() + self.widget.winfo_height() + 2
         self.tip = tk.Toplevel(self.widget)
         self.tip.overrideredirect(True)
+        # Sans -topmost, l'infobulle passerait sous les fenêtres de l'app, qui
+        # sont elles-mêmes toujours au premier plan.
         self.tip.attributes("-topmost", True)
-        self.tip.attributes("-alpha", 0.85)  # EVE UI glass effect
+        self.tip.attributes("-alpha", 0.85)  # effet verre de l'UI EVE
         self.tip.geometry(f"+{x}+{y}")
         lbl = tk.Label(self.tip, text=self.text, bg=BG_H, fg=T0,
                        font=tkfont.Font(family="Consolas", size=8),
@@ -564,16 +876,18 @@ class Tooltip:
                        padx=4, pady=1)
         lbl.pack()
 
-    # Détruit l'infobulle
+    # Détruite plutôt que masquée : une infobulle est éphémère, et garder un
+    # Toplevel par widget survolé accumulerait des fenêtres pour rien.
     def _hide(self, e):
         if self.tip:
             self.tip.destroy()
             self.tip = None
 
 
-# Infobulle dynamique dont le texte est généré par une fonction
+# Variante dont le texte est calculé AU SURVOL. Nécessaire pour tout ce qui
+# dépend de l'état courant — détail d'un calcul d'ISK, contenu d'une session —
+# qu'une chaîne figée à la construction afficherait périmé.
 class DynamicTooltip:
-    # Initialise avec une fonction génératrice de texte
     def __init__(self, widget, text_fn):
         self.widget = widget
         self.text_fn = text_fn
@@ -581,7 +895,7 @@ class DynamicTooltip:
         widget.bind("<Enter>", self._show, add="+")
         widget.bind("<Leave>", self._hide, add="+")
 
-    # Génère et affiche le texte dynamique
+    # text_fn() est appelée ici, pas à la construction : c'est tout l'intérêt.
     def _show(self, e):
         x = self.widget.winfo_rootx() + self.widget.winfo_width() // 2
         y = self.widget.winfo_rooty() + self.widget.winfo_height() + 2
@@ -596,7 +910,8 @@ class DynamicTooltip:
                        padx=4, pady=1)
         lbl.pack()
 
-    # Détruit l'infobulle
+    # Détruite plutôt que masquée : une infobulle est éphémère, et garder un
+    # Toplevel par widget survolé accumulerait des fenêtres pour rien.
     def _hide(self, e):
         if self.tip:
             self.tip.destroy()
@@ -606,7 +921,9 @@ class DynamicTooltip:
 def _get_resource_path(relative_path):
     if hasattr(sys, '_MEIPASS'):
         return os.path.join(sys._MEIPASS, relative_path)
-    # Try next to exe/script first, then current working directory
+    # D'abord à côté de l'exécutable ou du script, puis le dossier courant :
+    # sous PyInstaller la ressource est extraite près du binaire, alors qu'en
+    # développement elle vit à côté du .py.
     p = os.path.join(_BASE, relative_path)
     if os.path.exists(p):
         return p
@@ -642,31 +959,46 @@ class Data:
         # Suivi des anomalies
         self.anom_current = None         # dict de l'anomalie active (ou None)
         self.anom_completed = []         # liste des anomalies terminées
+        # Totaux cumulés : _anom_stats() tourne à chaque tick (250 ms) et
+        # faisait 3 passes O(n) sur anom_completed, qui grandit toute la session.
+        self.anom_total_time = 0.0
+        self.anom_total_isk  = 0
+        self.anom_best_isk   = 0
         self.anom_last_combat = None     # datetime du dernier événement de combat (UTC)
 
-        # Deque + somme glissante pour calcul DPS en O(1)
-        self.ed = deque(maxlen=1000)     # (ts, dmg) sortant
-        self.er = deque(maxlen=1000)     # (ts, dmg) entrant
+        # Deque borné + somme courante : le DPS est recalculé quatre fois par
+        # seconde et par personnage, donc re-sommer la fenêtre à chaque appel
+        # coûterait cher. La somme est maintenue à l'ajout et au retrait, ce qui
+        # rend dps() O(1) au lieu de O(n).
+        # maxlen borne aussi la mémoire : un combat très long ne fait pas enfler
+        # la liste indéfiniment.
+        self.ed = deque(maxlen=1000)     # (horodatage, dégâts) sortants
+        self.er = deque(maxlen=1000)     # (horodatage, dégâts) entrants
         self.ed_sum = 0
         self.er_sum = 0
 
-        # Historique DPS pour le graphique (échantillonné à chaque tick)
-        # Chaque entrée : (monotonic_ts, dps_out, dps_in)
+        # Historique pour le graphique, échantillonné à chaque tick.
+        # La taille est calculée pour couvrir exactement DPS_GRAPH_W secondes à
+        # la cadence de rafraîchissement : le deque se purge donc tout seul.
+        # Chaque entrée : (horodatage monotone, dps_out, dps_in)
         self.dps_hist = deque(maxlen=int(DPS_GRAPH_W * 1000 / DEF_POLL) + 1)
 
-    # Retourne le nombre de secondes totales de la session
+    # Durée de session = temps déjà accumulé + segment en cours. Ce découpage
+    # existe pour la pause : on ferme le segment courant dans acc_sec et on met
+    # t0 à None, ce qui gèle le compteur sans perdre l'historique.
     def secs(self):
         base = self.acc_sec
         if self.t0:
             base += (datetime.now(timezone.utc) - self.t0).total_seconds()
         return base
 
-    # Calcule le DPS en O(1) sur la fenêtre glissante DPS_W
+    # DPS sur la fenêtre glissante DPS_W.
     def dps(self, is_out=True):
-
-        # O(1) DPS — trims old entries live, no full list scan
-        # Uses time.monotonic() so PC/EVE server clock drift and NTP jumps can't
-        # cause entries to expire the instant they're added.
+        # Purge au fil de l'eau plutôt que balayage complet : chaque entrée
+        # n'est retirée qu'une fois, ce qui garde le coût amorti constant.
+        # time.monotonic() et non l'horloge murale : une correction NTP ou un
+        # décalage entre l'horloge du PC et celle du serveur EVE ferait expirer
+        # des entrées à l'instant même où on les ajoute.
         now = time.monotonic()
         cutoff = now - DPS_W
         deq = self.ed if is_out else self.er
@@ -677,12 +1009,18 @@ class Data:
             self.ed_sum = total
         else:
             self.er_sum = total
+        # Division par la fenêtre entière, pas par le temps réellement couvert :
+        # au début d'un combat le DPS monte donc progressivement, ce qui reflète
+        # mieux la réalité qu'un chiffre énorme calculé sur une seule salve.
         return total / DPS_W if deq else 0
 
-    # Enregistre un coup sortant et met à jour les totaux
+    # ts est ignoré au profit de time.monotonic() : l'horodatage du log vient de
+    # l'horloge du client EVE, qui peut dériver de celle du PC. Mélanger les deux
+    # sources fausserait la fenêtre glissante.
     def add_dmg_out(self, ts, dmg):
-        # If the deque is full, append() silently evicts ed[0]; subtract it from
-        # the running sum first so ed_sum stays == sum(dmg in ed) (O(1) invariant).
+        # Deque plein : append() évince silencieusement ed[0]. Il faut retirer sa
+        # contribution AVANT, sinon ed_sum cesserait d'égaler la somme réelle du
+        # deque et le DPS dériverait lentement à la hausse.
         if len(self.ed) == self.ed.maxlen:
             self.ed_sum -= self.ed[0][1]
         self.ed.append((time.monotonic(), dmg))
@@ -690,7 +1028,8 @@ class Data:
         self.dd += dmg
         self.hd += 1
 
-    # Enregistre un coup reçu et met à jour les totaux
+    # Symétrique de add_dmg_out ; on ne compte pas les « coups » entrants, seul
+    # le total de dégâts subis intéresse le joueur.
     def add_dmg_in(self, ts, dmg):
         if len(self.er) == self.er.maxlen:
             self.er_sum -= self.er[0][1]
@@ -698,16 +1037,36 @@ class Data:
         self.er_sum += dmg
         self.dr += dmg
 
-    # Calcule l'ISK/heure nette (bounties - taxes + loot)
+    # Les totaux sont cumulés ICI, à la clôture d'un site, parce que la lecture
+    # est bien plus fréquente que l'écriture : les statistiques d'anomalies sont
+    # relues à chaque tick, alors qu'un site ne se termine que toutes les
+    # quelques minutes. _anom_stats() reste ainsi en O(1).
+    def archive_anom(self, site):
+        self.anom_completed.append(site)
+        if site.get("end") and site.get("start"):
+            self.anom_total_time += max(0, (site["end"] - site["start"]).total_seconds())
+        isk = site.get("isk", 0)
+        self.anom_total_isk += isk
+        if isk > self.anom_best_isk:
+            self.anom_best_isk = isk
+
+    # ISK/heure net. Le seuil d'une minute évite le chiffre absurde des premiers
+    # instants : une seule bounty à trois secondes de session extrapolerait à des
+    # milliards par heure et n'apprendrait rien.
     def isk(self):
         s = self.secs()
         return ((self.bg * (1 - self.tax) + self.loot_val) / s * 3600) if s >= 60 else 0
 
 
-# ── History window ───────────────────────────────────────────────────
-# Fenêtre popup affichant l'historique des sessions passées
+# ── Fenêtre d'historique ─────────────────────────────────────────────
+# L'historique répond à la seule question que le joueur se pose entre deux
+# sessions : est-ce que ce vaisseau, ce site ou cette heure de jeu rapportent
+# plus que les précédents ? D'où l'affichage en tableau comparatif plutôt qu'en
+# résumé de la dernière session.
 class HistoryWindow:
-    # Columns: (header, json key, width, color)
+    # Table de description des colonnes : (en-tête, clé JSON, largeur, couleur).
+    # Déclaratif pour que l'en-tête, la largeur et le rendu ne puissent pas se
+    # désynchroniser quand on ajoute une métrique.
     COLS = [
         ("DATE",    "date",       17, TB),
         ("CHAR",    "character",  13, T1),
@@ -719,7 +1078,8 @@ class HistoryWindow:
         ("MSN",     "missions_done", 4, C_MSN),
     ]
 
-    # Construit la fenêtre avec en-tête, stats globales et grille de données
+    # char_name=None affiche la flotte entière ; renseigné, il filtre sur un
+    # pilote — c'est la vue utile quand on compare deux personnages.
     def __init__(self, parent, app, char_name=None):
         self.app = app
         self.char_name = char_name
@@ -727,14 +1087,24 @@ class HistoryWindow:
         self.w.overrideredirect(True)
         self.w.configure(bg=BG, highlightbackground=BDG, highlightcolor=BDG, highlightthickness=1)
         self.w.attributes("-topmost", True)
-        self.w.attributes("-alpha", app.alpha)  # Dynamically use app opacity
+        # Reprend l'opacité courante de l'app : une popup opaque au-dessus de
+        # fenêtres translucides jurerait visuellement.
+        self.w.attributes("-alpha", app.alpha)
 
+        # Position mémorisée : la fenêtre d'historique se consulte souvent au
+        # même endroit de l'écran, et la replacer à chaque ouverture serait
+        # pénible. À défaut, on la décale de l'appelante pour ne pas la masquer.
         saved = app.cfg.get("history_pos")
         if saved:
             self.w.geometry(f"580x400{saved}")
         else:
             self.w.geometry(f"580x400+{parent.winfo_x() + 30}+{parent.winfo_y() + 40}")
 
+        # Toutes les fenêtres sont en overrideredirect (aucune décoration
+        # système), donc il faut réimplémenter le déplacement à la main : on
+        # mémorise l'offset du clic, puis on repositionne pendant le glissé.
+        # pack_propagate(False) fige la hauteur de la barre, sinon elle se
+        # réduirait à la taille de son contenu.
         self._dx = self._dy = 0
 
         hdr = tk.Frame(self.w, bg=BG_H, height=32)
@@ -769,6 +1139,8 @@ class HistoryWindow:
         F9   = tkfont.Font(family="Consolas", size=9)
         F11B = tkfont.Font(family="Consolas", size=11, weight="bold")
 
+        # Cumuls sur TOUT l'historique filtré, pas seulement sur les 100 lignes
+        # affichées plus bas : le joueur veut son total à vie, pas un sous-total.
         total_isk   = sum(e.get("net_isk", 0)  for e in hist)
         total_kills = sum(e.get("kills", 0)    for e in hist)
         total_sites = sum(e.get("sites_cleared", 0) for e in hist)
@@ -795,7 +1167,8 @@ class HistoryWindow:
         self._sf.bind("<Configure>", lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
         self._canvas_win = canvas.create_window((0, 0), window=self._sf, anchor="nw")
 
-        # Stretch inner frame to fill canvas width
+        # Sans ça, le cadre interne garde la largeur de son contenu et les
+        # colonnes se tassent à gauche au lieu d'occuper la fenêtre.
         def _on_canvas_resize(e):
             canvas.itemconfig(self._canvas_win, width=e.width)
         canvas.bind("<Configure>", _on_canvas_resize)
@@ -803,40 +1176,44 @@ class HistoryWindow:
         canvas.pack(side="left", fill="both", expand=True)
         scrollbar.pack(side="right", fill="y")
         
-        # Safe scroll handler that checks if canvas still exists
+        # La molette est captée globalement (bind_all), donc l'événement peut
+        # encore arriver après la fermeture de la fenêtre : sans ce garde-fou,
+        # Tk lèverait sur un widget détruit.
         def _safe_scroll(e):
             try:
                 if canvas.winfo_exists():
                     canvas.yview_scroll(int(-1*(e.delta/120)), "units")
             except Exception:
-                pass
+                _log_exc("HistoryWindow.__init__._safe_scroll:930")
         
-        # Scope the global wheel hijack to when the cursor is actually over the
-        # history list (matches FleetManager's Enter/Leave pattern), so opening
-        # or closing History can't clobber other windows' scroll handling.
+        # La capture globale de la molette est limitée au survol de la liste
+        # (même principe que FleetManager) : sinon, ouvrir l'historique volerait
+        # le défilement à toutes les autres fenêtres de l'app.
         canvas.bind("<Enter>", lambda e: canvas.bind_all("<MouseWheel>", _safe_scroll))
         canvas.bind("<Leave>", lambda e: canvas.unbind_all("<MouseWheel>"))
-        self._canvas = canvas  # Store reference for cleanup
+        self._canvas = canvas  # conservé pour pouvoir délier la molette à la fermeture
 
         F8  = tkfont.Font(family="Consolas", size=8)
         F9  = tkfont.Font(family="Consolas", size=9)
         F9B = tkfont.Font(family="Consolas", size=9, weight="bold")
 
-        # ── Unified grid for header + data rows (proper alignment) ────
-        # Configure columns with minimum sizes and weights for proportional fill
+        # Une seule grille pour l'en-tête ET les données : deux grilles séparées
+        # dérivaient d'un ou deux pixels et les colonnes ne s'alignaient plus.
+        # minsize garantit la lisibilité, weight répartit l'espace restant.
         COL_PX     = [112, 78, 48, 64, 64, 40, 40, 30]
         COL_WEIGHT = [  3,  2,  1,  2,  2,  1,  1,  1]
         for i, (px, wt) in enumerate(zip(COL_PX, COL_WEIGHT)):
             self._sf.grid_columnconfigure(i, minsize=px, weight=wt)
 
-        # Header row
         grid_row = 0
         for i, (txt, key, wc, _) in enumerate(self.COLS):
             tk.Label(self._sf, text=txt, font=F8, bg=BG_H, fg=T1,
                      anchor="w", padx=3).grid(row=grid_row, column=i, sticky="ew")
         grid_row += 1
 
-        # ── Data rows ─────────────────────────────────────────────────
+        # Les 100 plus récentes, en ordre antichronologique : au-delà, le rendu
+        # de milliers de widgets Tk fige l'ouverture de la fenêtre, et les vieux
+        # totaux restent de toute façon dans le bandeau de cumuls ci-dessus.
         for entry in reversed(hist[-100:]):
             for i, (_, key, wc, c) in enumerate(self.COLS):
                 raw = entry.get(key, "?")
@@ -876,9 +1253,11 @@ class HistoryWindow:
             self.app.cfg["history_pos"] = f"+{self.w.winfo_x()}+{self.w.winfo_y()}"
             save_config(self.app.cfg)
         except Exception:
-            pass
+            _log_exc("HistoryWindow._save_geo:997")
 
-    # Vide l'historique et ferme la fenêtre
+    # Effacement ciblé : ouvert sur un personnage, on ne purge que SES sessions
+    # et on laisse celles des autres pilotes intactes. Sans ce filtre, vider
+    # l'historique d'un alt détruirait celui de tout le compte.
     def _clear_history(self):
         if self.char_name:
             hist = load_history()
@@ -888,207 +1267,35 @@ class HistoryWindow:
             save_history([])
         self._close()
 
-    # Sauvegarde la position et ferme la fenêtre
     def _close(self):
         self._save_geo()
-        # Unbind the global scroll handler to prevent errors after close
+        # La liaison molette était globale (bind_all) : sans ce détachement, elle
+        # survivrait à la fenêtre et détournerait le défilement des autres.
         try:
             if hasattr(self, '_canvas') and self._canvas:
                 self._canvas.unbind_all("<MouseWheel>")
         except Exception:
-            pass
+            _log_exc("HistoryWindow._close:1017")
         self.w.destroy()
 
 
-# ── Settings window ──────────────────────────────────────────────────
-# Fenêtre de paramètres (chemins, intervalle, opacité, taxe, thème)
-class Settings:
+# NOTE — la fenêtre de réglages « par personnage » qui vivait ici a été retirée.
+# Elle était inatteignable : son unique point d'entrée était
+# CharacterWindow._settings(), que personne n'appelait jamais (le bouton
+# engrenage de la vue d'ensemble appartient à MainUI et ouvre MainUISettings).
+# Elle écrivait de toute façon des clés de configuration PARTAGÉES, donc elle
+# n'avait jamais rien de spécifique à un personnage. Ses deux champs uniques,
+# UPDATE INTERVAL et SITE GAP, n'existaient nulle part ailleurs dans l'interface
+# et se trouvent désormais dans MainUISettings.
 
-    # Construit le formulaire de paramètres
-    def __init__(self, parent, app):
-        self.app = app
-        self.w = tk.Toplevel(parent)
-        self.w.overrideredirect(True)
-        self.w.configure(bg=BG, highlightbackground=BDG, highlightcolor=BDG, highlightthickness=1)
-        self.w.attributes("-topmost", True)
-        self.w.attributes("-alpha", app.alpha)  # Dynamically use app opacity
-
-        saved = app.char_cfg.get("settings_pos")
-        saved_geo = app.char_cfg.get("settings_geo")
-        if saved_geo and saved:
-            self.w.geometry(f"{saved_geo}{saved}")
-        elif saved:
-            self.w.geometry(f"340x340{saved}")
-        else:
-            self.w.geometry(f"340x340+{parent.winfo_x() + 30}+{parent.winfo_y() + 40}")
-
-        self._dx = self._dy = 0
-
-        hdr = tk.Frame(self.w, bg=BG_H, height=32)
-        hdr.pack(fill="x")
-        hdr.pack_propagate(False)
-        hdr.bind("<Button-1>", lambda e: (setattr(self, '_dx', e.x), setattr(self, '_dy', e.y)))
-        hdr.bind("<B1-Motion>", lambda e: self.w.geometry(
-            f"+{self.w.winfo_x() + e.x - self._dx}+{self.w.winfo_y() + e.y - self._dy}"))
-        hdr.bind("<ButtonRelease-1>", lambda e: self._save_geo())
-
-        tk.Frame(hdr, bg=T0, width=3).pack(side="left", fill="y")
-        tk.Label(hdr, text="  \u2699 SETTINGS",
-                 font=tkfont.Font(family="Consolas", size=10, weight="bold"),
-                 bg=BG_H, fg=T0).pack(side="left")
-        xb = tk.Label(hdr, text="\u2715",
-                      font=tkfont.Font(family="Consolas", size=12, weight="bold"),
-                      bg=BG_H, fg=TD, padx=8, cursor="hand2")
-        xb.pack(side="right", fill="y")
-        xb.bind("<Button-1>", lambda e: self._close())
-        xb.bind("<Enter>", lambda e: xb.config(fg=CR))
-        xb.bind("<Leave>", lambda e: xb.config(fg=TD))
-        tk.Frame(self.w, bg=BDG, height=1).pack(fill="x")
-
-        # Resize grip — pack BEFORE body so it claims bottom space
-        btm = tk.Frame(self.w, bg=BG, height=14)
-        btm.pack(fill="x", side="bottom")
-        btm.pack_propagate(False)
-        grip_f = tk.Frame(btm, bg=BDG, width=14, height=14, cursor="bottom_right_corner")
-        grip_f.pack(side="right", padx=1, pady=1)
-        grip_f.pack_propagate(False)
-        grip_l = tk.Label(grip_f, text="\u2921", font=tkfont.Font(family="Consolas", size=9),
-                          bg=BDG, fg=T1, cursor="bottom_right_corner")
-        grip_l.pack(expand=True)
-        for w in (grip_f, grip_l):
-            w.bind("<Button-1>", self._resize_start)
-            w.bind("<B1-Motion>", self._resize_drag)
-            w.bind("<ButtonRelease-1>", self._resize_end)
-
-        body = tk.Frame(self.w, bg=BG_POP)
-        body.pack(fill="both", expand=True, padx=10, pady=10)
-        lf = tkfont.Font(family="Consolas", size=9)
-        ek = dict(font=tkfont.Font(family="Consolas", size=10), bg=BG_C, fg=TB,
-                  insertbackground=TB, relief="flat", bd=0,
-                  highlightthickness=1, highlightbackground=BD, highlightcolor=BDG)
-
-        tk.Label(body, text="GAMELOGS PATH", font=lf, bg=BG_POP, fg=TD).pack(anchor="w", pady=(0, 2))
-        self.pv = tk.StringVar(value=app.log_path)
-        tk.Entry(body, textvariable=self.pv, width=36, **ek).pack(fill="x", pady=(0, 8))
-
-        for lbl, attr, default in [("UPDATE INTERVAL (ms)", "iv", str(app.poll_ms)),
-                                     ("OPACITY %",           "av", str(int(app.alpha * 100))),
-                                     ("CORP TAX %",          "tv", app.tax_var.get()),
-                                     ("SITE GAP (sec)",      "gv", str(app.anom_gap))]:
-            r = tk.Frame(body, bg=BG_POP)
-            r.pack(fill="x", pady=(0, 6))
-            tk.Label(r, text=lbl, font=lf, bg=BG_POP, fg=TD).pack(side="left")
-            sv = tk.StringVar(value=default)
-            setattr(self, attr, sv)
-            tk.Entry(r, textvariable=sv, width=8, **ek).pack(side="right")
-
-        # Theme selector
-        tk.Label(body, text="THEME", font=lf, bg=BG_POP, fg=TD).pack(anchor="w", pady=(0, 2))
-        self._theme_var = tk.StringVar(value=app._current_theme)
-        self._theme_cb = ttk.Combobox(body, textvariable=self._theme_var, state="readonly",
-                                       style="E.TCombobox", font=tkfont.Font(family="Consolas", size=9),
-                                       values=THEME_NAMES)
-        self._theme_cb.pack(fill="x", pady=(0, 8))
-
-        ap = tk.Label(body, text="\u2714 APPLY",
-                      font=tkfont.Font(family="Consolas", size=10, weight="bold"),
-                      bg=BG_POP, fg=CA, cursor="hand2", padx=12)
-        ap.pack(side="right", pady=(6, 0))
-        ap.bind("<Button-1>", lambda e: self._apply())
-        ap.bind("<Enter>", lambda e: ap.config(bg=BDG))
-        ap.bind("<Leave>", lambda e: ap.config(bg=BG_POP))
-
-    # Démarre le redimensionnement par glisser
-    def _resize_start(self, e):
-        self._rw = self.w.winfo_width()
-        self._rh = self.w.winfo_height()
-        self._rx = e.x_root
-        self._ry = e.y_root
-        self._wx = self.w.winfo_x()
-        self._wy = self.w.winfo_y()
-
-    # Applique le redimensionnement en cours de glisser
-    def _resize_drag(self, e):
-        nw = max(300, self._rw + (e.x_root - self._rx))
-        nh = max(200, self._rh + (e.y_root - self._ry))
-        self.w.geometry(f"{nw}x{nh}+{self._wx}+{self._wy}")
-
-    # Termine le redimensionnement et sauvegarde
-    def _resize_end(self, e): self._save_geo()
-
-    # Sauvegarde la géométrie de la fenêtre
-    def _save_geo(self):
-        try:
-            w = self.w.winfo_width()
-            h = self.w.winfo_height()
-            self.app.char_cfg["settings_geo"] = f"{w}x{h}"
-            self.app.char_cfg["settings_pos"] = f"+{self.w.winfo_x()}+{self.w.winfo_y()}"
-            save_config(self.app.cfg)
-        except Exception:
-            pass
-
-    # Applique les paramètres modifiés et reconstruit l'UI si le thème change
-    def _apply(self):
-        a = self.app
-        a.log_path = self.pv.get().strip()
-        a.cfg["log_path"] = a.log_path
-        try:
-            a.poll_ms = max(100, int(self.iv.get()))
-            a.cfg["poll_ms"] = a.poll_ms
-        except Exception:
-            pass
-        try:
-            v = max(20, min(100, int(self.av.get())))
-            a.alpha = v / 100
-            a.cfg["alpha"] = a.alpha
-            a.root.attributes("-alpha", a.alpha)
-            
-            # Apply opacity to any active detached windows
-            if a._isk_window and a._isk_window.w.winfo_exists():
-                a._isk_window.w.attributes("-alpha", a.alpha)
-            if a._msn_window and a._msn_window.w.winfo_exists():
-                a._msn_window.w.attributes("-alpha", a.alpha)
-            if a._anom_window and a._anom_window.w.winfo_exists():
-                a._anom_window.w.attributes("-alpha", a.alpha)
-            if a._alert_window and a._alert_window.w.winfo_exists():
-                a._alert_window.w.attributes("-alpha", a.alpha)
-            
-            # Apply opacity to History if it happens to be open
-            if a._hw and a._hw.w.winfo_exists():
-                a._hw.w.attributes("-alpha", a.alpha)
-                
-        except Exception:
-            pass
-        a.tax_var.set(self.tv.get())
-        a.cfg["tax"] = self.tv.get()
-        try:
-            g = max(10, min(120, int(self.gv.get())))
-            a.anom_gap = g
-            a.cfg["anom_gap"] = g
-        except Exception:
-            pass
-
-        new_theme = self._theme_var.get()
-        theme_changed = (new_theme != a._current_theme)
-        if theme_changed:
-            a._current_theme = new_theme
-            a.char_cfg["theme"] = new_theme
-
-        save_config(a.cfg)
-
-        if theme_changed:
-            a._apply_theme_live()   # recolour in-place — no flicker, window stays open
-
-    # Sauvegarde et ferme la fenêtre de paramètres
-    def _close(self):
-        self._save_geo()
-        self.w.destroy()
-
-
-# ── Detached panel window ────────────────────────────────────────────
-# Fenêtre flottante détachable pour n'importe quelle section
+# ── Panneau détaché ──────────────────────────────────────────────────
+# Enveloppe générique de détachement. Le joueur n'a pas la place d'afficher tout
+# le tableau de bord par-dessus EVE : il sort une seule section — l'ISK, les
+# alertes — et la pose où il veut, souvent sur un second écran.
+# La classe ne connaît AUCUNE section en particulier : elle reçoit build_fn et
+# rappelle la même fonction de construction que la fenêtre principale, ce qui
+# garantit qu'un panneau détaché reste identique à sa version intégrée.
 class DetachedWindow:
-    # Construit la fenêtre avec en-tête de glisser, grip de redimensionnement et contenu
     def __init__(self, parent, app, title, accent, section_key, build_fn, char_name: str = ""):
         self.app = app
         self.section_key = section_key
@@ -1098,6 +1305,9 @@ class DetachedWindow:
         self.w.attributes("-topmost", True)
         self.w.attributes("-alpha", app.alpha)
 
+        # Position et taille sont mémorisées PAR SECTION ET PAR PERSONNAGE :
+        # une disposition d'écran se construit une fois et doit se retrouver
+        # telle quelle au lancement suivant.
         pos_key = f"{section_key}_detach_pos"
         saved = app.char_cfg.get(pos_key)
         if saved:
@@ -1109,7 +1319,9 @@ class DetachedWindow:
         self._resizing = False
         self._rw = self._rh = 0
 
-        # Header with drag + reattach (X)
+        # En-tête : poignée de déplacement, et le X réintègre la section dans la
+        # fenêtre principale au lieu de la détruire — fermer ne doit pas faire
+        # disparaître la section du tableau de bord.
         hdr = tk.Frame(self.w, bg=BG_H, height=28)
         hdr.pack(fill="x")
         hdr.pack_propagate(False)
@@ -1142,7 +1354,8 @@ class DetachedWindow:
 
         tk.Frame(self.w, bg=BDG, height=1).pack(fill="x")
 
-        # Bottom bar with resize grip — pack BEFORE body so it claims space
+        # Barre du bas empaquetée AVANT le corps : sans ça, un contenu qui
+        # grandit lui prend toute la place et la poignée devient inatteignable.
         btm = tk.Frame(self.w, bg=BG, height=14)
         btm.pack(fill="x", side="bottom")
         btm.pack_propagate(False)
@@ -1159,15 +1372,20 @@ class DetachedWindow:
             child.bind("<B1-Motion>", self._resize_drag)
             child.bind("<ButtonRelease-1>", self._resize_end)
 
-        # Build the section content
+        # build_fn est la fonction de construction de la section, appelée avec
+        # detached=True : c'est elle qui décide des quelques différences de mise
+        # en page entre version intégrée et version flottante.
         self.body = tk.Frame(self.w, bg=BG)
         self.body.pack(fill="both", expand=True, padx=3, pady=3)
         build_fn(self.body, detached=True)
 
-        # Fit to content
+        # update_idletasks force Tk à calculer la mise en page maintenant :
+        # sans ça, winfo_reqwidth() renverrait 1 et la fenêtre s'ouvrirait
+        # minuscule avant de sauter à sa vraie taille.
         self.w.update_idletasks()
         
-        # Prevent layout locking by relying on content width instead of hardcoded minimums
+        # Taille déduite du contenu plutôt que de minimums codés en dur : un
+        # minimum figé bloquait la mise en page des sections plus étroites.
         req_w = max(self.body.winfo_reqwidth() + 10, 60)
         req_h = self.body.winfo_reqheight() + 40
         
@@ -1196,7 +1414,9 @@ class DetachedWindow:
     # Applique le redimensionnement en cours
     def _resize_drag(self, e):
         if not self._resizing: return
-        # Limit to 60px minimum width to keep the drag header and close button accessible
+        # Plancher de 60 px : en dessous, l'en-tête de déplacement et le bouton
+        # de fermeture deviennent trop petits pour être cliqués, et la fenêtre
+        # ne peut plus être ni bougée ni refermée.
         nw = max(60, self._rw + (e.x_root - self._rx))
         nh = max(40,  self._rh + (e.y_root - self._ry))
         self.w.geometry(f"{nw}x{nh}+{self._wx}+{self._wy}")
@@ -1215,20 +1435,24 @@ class DetachedWindow:
             self.app.char_cfg[f"{self.section_key}_detach_pos"] = f"+{self.w.winfo_x()}+{self.w.winfo_y()}"
             save_config(self.app.cfg)
         except Exception:
-            pass
+            _log_exc("DetachedWindow._save_geometry:1158")
 
-    # Sauvegarde la géométrie et réattache la section à la fenêtre principale
+    # La géométrie est enregistrée AVANT la destruction : après destroy(), les
+    # winfo_* ne renvoient plus rien d'exploitable et la position serait perdue.
     def _reattach(self):
-
-        # Save position and size
         self._save_geometry()
         self.w.destroy()
         self.app._reattach(self.section_key)
 
 
-# ── Standalone DPS overlay ───────────────────────────────────────────
-# Overlay DPS autonome (indépendant du dashboard) : transparent, déplaçable,
-# verrouillable en click-through, 3 vues (nombres / graphe / les deux).
+# ── Overlay DPS autonome ─────────────────────────────────────────────
+# Overlay DPS autonome, pensé pour être posé PAR-DESSUS le jeu et oublié : il
+# imite le cadre « messages » d'EVE, sans fenêtre visible, pour que le joueur
+# garde ses chiffres sous les yeux sans quitter le combat du regard.
+# Il est délibérément indépendant du tableau de bord : on veut pouvoir masquer
+# tout le reste et ne garder que ces deux nombres à l'écran.
+# Deux modes : DÉPLACEMENT (cadre visible, on le pose) et POSÉ (transparent et
+# traversant à la souris, les clics vont au jeu).
 class DPSOverlay:
     VIEW_NUMBERS, VIEW_GRAPH, VIEW_BOTH = 0, 1, 2
     _VIEW_COUNT = 3
@@ -1251,13 +1475,18 @@ class DPSOverlay:
         self.w.overrideredirect(True)
         self.w.configure(bg=OVERLAY_KEY, highlightthickness=0)
         self.w.attributes("-topmost", True)
-        self.w.attributes("-alpha", 1.0)   # crisp text; independent of global opacity
+        # Opacité pleine, indépendante du réglage global : le reste de l'app
+        # peut être translucide, mais des chiffres à demi transparents sur un
+        # fond spatial deviennent illisibles.
+        self.w.attributes("-alpha", 1.0)
         try:
-            # Color-key the background fully transparent (Windows). Only text /
-            # graph lines show over EVE, like a message frame. Ignored off-Windows.
+            # Cœur de l'effet : Windows rend invisible tout pixel exactement de
+            # cette teinte, donc seuls le texte et les courbes subsistent
+            # au-dessus d'EVE. Ailleurs qu'Windows l'attribut n'existe pas et
+            # l'overlay reste un rectangle opaque — dégradé acceptable.
             self.w.attributes("-transparentcolor", OVERLAY_KEY)
         except Exception:
-            pass
+            _log_exc("DPSOverlay.__init__:1200")
 
         saved_pos = self.char_cfg.get("dps_overlay_pos")
         saved_geo = self.char_cfg.get("dps_overlay_geo")
@@ -1268,7 +1497,9 @@ class DPSOverlay:
         else:
             self.w.geometry(f"230x96+{main_ui.root.winfo_x()+60}+{main_ui.root.winfo_y()+60}")
 
-        # Reusable fonts (rescaled on resize)
+        # Objets Font RÉUTILISÉS : la mise à l'échelle se contente de changer
+        # leur taille, ce qui repeint les labels sans les reconstruire — créer
+        # une police par redimensionnement ferait clignoter l'overlay.
         self._num_font   = tkfont.Font(family="Consolas", size=22, weight="bold")
         self._title_font = tkfont.Font(family="Consolas", size=8,  weight="bold")
 
@@ -1277,8 +1508,9 @@ class DPSOverlay:
         self.w.after(120, self._finalize_scale)
         self._refresh()
 
-        # Fresh overlay (no saved position) opens in MOVE mode so the owner can
-        # place it; a restored one comes back placed (SET mode) as clean text.
+        # Un overlay tout neuf s'ouvre en mode DÉPLACEMENT : posé d'emblée, il
+        # serait transparent ET traversant, donc invisible et impossible à
+        # attraper. Un overlay restauré revient à l'état où il était.
         if saved_pos:
             self.locked = bool(self.char_cfg.get("dps_overlay_locked", True))
         else:
@@ -1286,17 +1518,20 @@ class DPSOverlay:
         self.w.update_idletasks()
         self._apply_mode()
 
-    # ── Chrome: transparent body + move-mode contour / ✕ / grip (no header) ──
+    # Pas de barre de titre : elle occuperait de la place et trahirait la
+    # présence d'une fenêtre. Le contour, le ✕ et la poignée n'apparaissent
+    # qu'en mode déplacement, et disparaissent une fois l'overlay posé.
     def _build_chrome(self):
         self.body = tk.Frame(self.w, bg=OVERLAY_KEY)
 
-        # ✕ = set position (exit move mode). Top-right, visible only while moving.
+        # Le ✕ ne ferme pas : il POSE l'overlay (sort du mode déplacement).
+        # Fermer se fait depuis la vue d'ensemble, là où on l'a ouvert.
         self._xbtn = tk.Label(self.w, text="✕",
                               font=tkfont.Font(family="Consolas", size=10, weight="bold"),
                               bg=OVERLAY_MOVE_BG, fg="#ffffff", cursor="hand2")
         self._xbtn.bind("<Button-1>", lambda e: self.toggle_lock(force=True))
 
-        # Resize grip, bottom-right, visible only while moving.
+        # Poignée de redimensionnement, visible seulement en déplacement.
         self._grip = tk.Label(self.w, text="⤡",
                               font=tkfont.Font(family="Consolas", size=9),
                               bg=OVERLAY_MOVE_BG, fg="#ffffff", cursor="bottom_right_corner")
@@ -1304,7 +1539,9 @@ class DPSOverlay:
         self._grip.bind("<B1-Motion>", self._resize_drag)
         self._grip.bind("<ButtonRelease-1>", self._resize_end)
 
-        # Drag the window by grabbing the body (guarded to move mode in _drag).
+        # On attrape l'overlay par son corps entier plutôt que par une zone
+        # dédiée : en mode chiffres seuls, il n'y a presque rien d'autre à
+        # viser. _drag ignore l'événement quand l'overlay est posé.
         self.body.bind("<Button-1>", self._drag_start)
         self.body.bind("<B1-Motion>", self._drag)
         self.body.bind("<ButtonRelease-1>", lambda e: self._save_geo())
@@ -1327,15 +1564,27 @@ class DPSOverlay:
             self._build_numbers(top, inline=True)
             self._graph = tk.Canvas(self.body, bg=OVERLAY_KEY, highlightthickness=0, bd=0)
             self._graph.pack(fill="both", expand=True, padx=3, pady=(2, 3))
-        # New children must match the current mode's backdrop (keyed vs move).
+        # Les widgets qui viennent d'être créés doivent adopter le fond du mode
+        # courant : sinon un cadre resté opaque dessinerait un rectangle visible
+        # par-dessus le jeu.
         self._set_body_bg(OVERLAY_MOVE_BG if not self.locked else OVERLAY_KEY)
 
     def _build_numbers(self, parent, inline=False):
+        # Conteneur des chiffres, retenu pour _apply_scale : c'est la SEULE
+        # partie qui peut être rognée. Le graphique, lui, est un Canvas en
+        # expand=True qui se laisse comprimer sans rien perdre (il se redessine
+        # à la taille réellement allouée), donc le mesurer fausserait le calcul.
+        self._num_box = parent
+
         def _bind_drag(*widgets):
             for _w in widgets:
                 _w.bind("<Button-1>", self._drag_start)
                 _w.bind("<B1-Motion>", self._drag)
                 _w.bind("<ButtonRelease-1>", lambda e: self._save_geo())
+        # Deux dispositions pour deux usages : CÔTE À CÔTE quand le graphique
+        # occupe déjà la hauteur, EMPILÉ quand les chiffres sont seuls et
+        # peuvent s'étaler. Les deux flèches ▸ ◂ pointent vers l'extérieur pour
+        # suggérer le sens : ce qui sort, ce qui rentre.
         if inline:
             of = tk.Frame(parent, bg=OVERLAY_KEY); of.pack(side="left", expand=True, fill="x")
             t1 = tk.Label(of, text="▸ OUT", font=self._title_font, bg=OVERLAY_KEY, fg=CD, anchor="w")
@@ -1361,6 +1610,9 @@ class DPSOverlay:
             self._in_lbl.pack(side="right")
             _bind_drag(orow, t1, self._out_lbl, irow, t2, self._in_lbl)
 
+    # Boucle propre à l'overlay, indépendante du tick du tableau de bord : il
+    # doit continuer à afficher le DPS même quand la fenêtre du personnage est
+    # masquée, puisque c'est justement son intérêt.
     def _refresh(self):
         try:
             d = self.win.data
@@ -1371,48 +1623,69 @@ class DPSOverlay:
             if self._graph is not None:
                 self._redraw_graph()
         except Exception:
-            pass
+            _log_exc("DPSOverlay._refresh:1314")
         try:
             self._job = self.w.after(getattr(self.win, "poll_ms", DEF_POLL), self._refresh)
         except Exception:
+            # Fenêtre détruite entre deux tours : on laisse la chaîne s'arrêter
+            # plutôt que de replanifier sur un widget qui n'existe plus.
             self._job = None
 
     def _redraw_graph(self):
         try:
+            # winfo_viewable() en plus de winfo_exists() : dessiner dans un
+            # canvas non affiché coûte du temps pour rien, et l'overlay peut
+            # être masqué alors que sa boucle tourne encore.
             if self._graph.winfo_exists() and self._graph.winfo_viewable():
                 draw_dps_graph(self._graph, self.win.data.dps_hist, is_detached=True)
         except Exception:
-            pass
+            _log_exc("DPSOverlay._redraw_graph:1325")
 
-    # ── Views ──
+    # ── Vues ──
+    # Le cycle est le seul moyen de changer de vue : l'overlay n'a pas de menu
+    # à lui, tout se pilote depuis la cellule DPS de la vue d'ensemble.
     def cycle_view(self):
         self.set_view((self.view + 1) % self._VIEW_COUNT)
 
     def set_view(self, i):
+        # Modulo plutôt qu'une borne : cycle_view() peut dépasser le compte, et
+        # une vue enregistrée par une version antérieure pourrait ne plus exister.
         self.view = i % self._VIEW_COUNT
         self.char_cfg["dps_overlay_view"] = self.view
         save_config(self.cfg)
         self._build_view()
+        # La remise à zéro force _apply_scale à recalculer : la nouvelle vue
+        # n'a ni le même nombre de rangées ni les mêmes besoins de hauteur.
+        # Le léger différé laisse Tk disposer les widgets avant de les mesurer.
         self._last_scale_h = 0
         self.w.after(30, self._apply_scale)
 
-    # ── Resize scaling ──
+    # ── Mise à l'échelle au redimensionnement ──
+    # Le texte suit la taille de la fenêtre : l'overlay doit rester lisible
+    # aussi bien en vignette dans un coin qu'agrandi sur un second écran.
     def _on_resize(self, event):
+        # Garde de réentrance : changer la police provoque un <Configure>, qui
+        # rappellerait cette fonction en boucle.
         if self._scaling:
             return
         h = event.height
+        # Seuil de 8 px : sans lui, chaque pixel de glissé recalculerait les
+        # polices et le redimensionnement deviendrait saccadé.
         if abs(h - self._last_scale_h) < 8:
             return
         self._last_scale_h = h
         self._apply_scale(h)
 
+    # Passe finale après l'ouverture : à la construction, Tk n'a pas encore
+    # attribué sa taille définitive à la fenêtre, donc le premier calcul se
+    # ferait sur des dimensions provisoires.
     def _finalize_scale(self):
         try:
             if self.w.winfo_exists():
                 self._last_scale_h = 0
                 self._apply_scale()
         except Exception:
-            pass
+            _log_exc("DPSOverlay._finalize_scale:1355")
 
     def _apply_scale(self, h=None):
         if self._scaling:
@@ -1423,19 +1696,53 @@ class DPSOverlay:
                 h = self.body.winfo_height()
             if h < 8:
                 return
-            base = 60 if self.view == self.VIEW_BOTH else 44
+            # La vue « chiffres seuls » EMPILE deux rangées (OUT au-dessus de
+            # IN) alors que la vue combinée les met côte à côte sur une seule
+            # rangée. Sa base doit donc être environ doublée, sinon la police
+            # est calculée comme s'il n'y avait qu'une rangée : à 220x90 on
+            # obtenait du 38 pt pour deux rangées dans 84 px, et Tk rognait le
+            # chiffre IN jusqu'à le rendre illisible.
+            base = 60 if self.view == self.VIEW_BOTH else 88
             scale = max(0.5, min(3.0, h / base))
-            self._num_font.configure(size=max(10, min(48, int(20 * scale))))
+            size = max(10, min(48, int(20 * scale)))
+            self._num_font.configure(size=size)
             self._title_font.configure(size=max(7, min(12, int(8 * scale))))
+
+            # Filet de sécurité : la base ci-dessus suppose une police et un DPI
+            # donnés. On mesure ce que les chiffres RÉCLAMENT vraiment et on
+            # réduit tant que ça dépasse, pour qu'aucun ne puisse être rogné,
+            # quelle que soit la police ou la mise à l'échelle de l'écran.
+            # On ne mesure QUE le bloc des chiffres : en vue combinée, le corps
+            # contient aussi le Canvas du graphique, dont la hauteur DEMANDÉE
+            # (plusieurs centaines de pixels) n'a rien à voir avec la place
+            # qu'il occupe réellement — le prendre en compte rabotait la police
+            # jusqu'au plancher à chaque redimensionnement.
+            # En vue combinée on garde en plus de quoi afficher le graphique,
+            # sinon les chiffres le réduiraient à rien.
+            box = getattr(self, "_num_box", None)
+            if box is not None:
+                budget = int(h * 0.6) if self.view == self.VIEW_BOTH else h
+                for _ in range(12):
+                    box.update_idletasks()
+                    if box.winfo_reqheight() <= budget or size <= 10:
+                        break
+                    size = max(10, size - 2)
+                    self._num_font.configure(size=size)
+
             if self._graph is not None:
                 self._redraw_graph()
         finally:
             self._scaling = False
 
-    # ── Set / move mode ──
+    # ── Mode posé / mode déplacement ──
     def toggle_lock(self, force=None):
-        """locked=True → set mode (placed, pure text, click-through);
-        locked=False → move mode (solid frame, white contour, ✕ + grip)."""
+        """locked=True → POSÉ : texte nu, transparent, traversant à la souris.
+        locked=False → DÉPLACEMENT : fond opaque, contour blanc, ✕ et poignée.
+
+        Les deux états sont incompatibles par nature : posé, l'overlay ne reçoit
+        plus aucun clic (ils vont au jeu), donc il faut un mode explicite pour
+        pouvoir le rattraper et le déplacer.
+        """
         self.locked = (not self.locked) if force is None else bool(force)
         self._apply_mode()
         self.char_cfg["dps_overlay_locked"] = self.locked
@@ -1443,24 +1750,32 @@ class DPSOverlay:
         try:
             self.mu._reflect_overlay_state(self.win.char_id)
         except Exception:
-            pass
+            _log_exc("DPSOverlay.toggle_lock:1386")
 
     def _set_body_bg(self, color):
-        """Recolour body + all descendants (frames/labels/canvas) to `color`.
-        Solid OVERLAY_MOVE_BG while moving (grabbable), OVERLAY_KEY when placed."""
+        """Repeint le corps ET toute sa descendance.
+
+        Il faut descendre l'arbre entier : la transparence par couleur-clé
+        s'applique pixel par pixel, donc un seul cadre intérieur resté opaque
+        dessinerait un rectangle visible au-dessus du jeu.
+        Parcours itératif plutôt que récursif — la profondeur est faible, et
+        cela évite d'empiler des appels dans un chemin déclenché à chaque
+        changement de mode.
+        """
         stack = [self.body]
         while stack:
             w = stack.pop()
             try:
                 w.configure(bg=color)
             except Exception:
-                pass
+                _log_exc("DPSOverlay._set_body_bg:1397")
             stack.extend(w.winfo_children())
 
     def _apply_mode(self):
-        """Apply the chrome for the current mode (self.locked)."""
+        """Applique l'habillage correspondant au mode courant."""
         move = not self.locked
-        # Solid movable frame while moving; keyed-transparent pure text once placed.
+        # En déplacement, le fond opaque rend TOUTE la surface attrapable ; une
+        # fois posé, la couleur-clé la fait disparaître et il ne reste que le texte.
         self._set_body_bg(OVERLAY_MOVE_BG if move else OVERLAY_KEY)
         try:
             if move:
@@ -1473,8 +1788,12 @@ class DPSOverlay:
                 self._xbtn.place_forget()
                 self._grip.place_forget()
         except Exception:
-            pass
-        # Windows click-through only in set mode (clicks pass to EVE over the text).
+            _log_exc("DPSOverlay._apply_mode:1416")
+        # Click-through : sans WS_EX_TRANSPARENT, l'overlay est invisible mais
+        # intercepte quand même les clics, et le joueur ne pourrait plus cliquer
+        # sur ce qui se trouve derrière — c'est-à-dire son propre vaisseau.
+        # Uniquement en mode posé, sinon on ne pourrait plus l'attraper.
+        # Windows seulement : ailleurs, l'overlay reste cliquable (dégradé).
         if sys.platform == "win32":
             try:
                 import ctypes
@@ -1489,9 +1808,12 @@ class DPSOverlay:
                     style = style & ~WS_EX_TRANSPARENT
                 ctypes.windll.user32.SetWindowLongW(hwnd, GWL_EXSTYLE, style)
             except Exception:
-                pass
+                _log_exc("DPSOverlay._apply_mode:1432")
 
-    # ── Drag / resize / geometry ──
+    # ── Déplacement, redimensionnement, géométrie ──
+    # Les deux gardes `if self.locked` sont la deuxième ligne de défense après
+    # le click-through : sous un système sans WS_EX_TRANSPARENT, elles évitent
+    # qu'un overlay posé se déplace au moindre clic.
     def _drag_start(self, e):
         if self.locked:
             return
@@ -1508,6 +1830,8 @@ class DPSOverlay:
         self._wx = self.w.winfo_x(); self._wy = self.w.winfo_y()
 
     def _resize_drag(self, e):
+        # Planchers de 120x60 : en dessous, le ✕ et la poignée se chevauchent et
+        # l'overlay ne peut plus être ni posé ni redimensionné.
         nw = max(120, self._rw + (e.x_root - self._rx))
         nh = max(60,  self._rh + (e.y_root - self._ry))
         self.w.geometry(f"{nw}x{nh}+{self._wx}+{self._wy}")
@@ -1521,17 +1845,21 @@ class DPSOverlay:
             self.char_cfg["dps_overlay_pos"] = f"+{self.w.winfo_x()}+{self.w.winfo_y()}"
             save_config(self.cfg)
         except Exception:
-            pass
+            _log_exc("DPSOverlay._save_geo:1464")
 
     def apply_alpha(self, a):
-        # Overlay transparency is the color-key (background), independent of the
-        # global opacity slider. Intentionally a no-op so the slider never fades it.
+        # VOLONTAIREMENT sans effet. La transparence de l'overlay vient de la
+        # couleur-clé, pas de l'alpha de la fenêtre : lui appliquer le curseur
+        # d'opacité globale ferait pâlir les chiffres eux-mêmes, alors que le
+        # réglage ne vise que le fond des autres fenêtres.
         return
 
+    # La géométrie est enregistrée AVANT destroy() : après, les winfo_* ne
+    # renvoient plus rien et l'overlay rouvrirait à sa position par défaut.
     def close(self):
         if self._job:
             try: self.w.after_cancel(self._job)
-            except Exception: pass
+            except Exception: _log_exc("DPSOverlay.close:1475")
             self._job = None
         self._save_geo()
         self.char_cfg["dps_overlay_open"] = False
@@ -1539,30 +1867,43 @@ class DPSOverlay:
         try:
             self.w.destroy()
         except Exception:
-            pass
+            _log_exc("DPSOverlay.close:1482")
         try:
             self.mu._on_overlay_closed(self.win.char_id)
         except Exception:
-            pass
+            _log_exc("DPSOverlay.close:1486")
 
 
-# ── Main app ─────────────────────────────────────────────────────────
-# Application principale du dashboard de ratting EVE Online
+# ── Tableau de bord d'un personnage ──────────────────────────────────
+# Une fenêtre par pilote. C'est la classe centrale : elle possède le lecteur de
+# log, l'état de session, l'interface et les deux boucles temporelles.
+# Le découpage par personnage vient du jeu lui-même — EVE écrit un gamelog
+# distinct par pilote, et le multi-comptes est la norme en PvE. Chaque fenêtre
+# est donc autonome : sa session, ses totaux et ses réglages ne regardent
+# qu'elle, et fermer l'une n'affecte pas les autres.
 class CharacterWindow:
 
-    # Initialise la config, les données, l'UI et démarre les boucles de poll/tick
     def __init__(self, root_tk, main_ui, char_id: str, char_name: str, log_file: str, cfg: dict):
         top = tk.Toplevel(root_tk)
-        top.withdraw()           # stay hidden until MainUI explicitly shows it (prevents flash)
+        # Masquée jusqu'à ce que MainUI décide de l'afficher : sans ça, la
+        # fenêtre apparaît brièvement à sa position par défaut avant d'être
+        # replacée, ce qui produit un sursaut visible au démarrage.
+        top.withdraw()
+        # overrideredirect : aucune décoration système. L'app doit ressembler à
+        # une extension de l'UI d'EVE, pas à une application Windows posée
+        # par-dessus — d'où les barres de titre et poignées réimplémentées.
         top.overrideredirect(True)
         top.configure(bg=BG)
         top.attributes("-topmost", True)
-        self.root = top          # keep self.root; all existing refs work unchanged
+        self.root = top
 
         self.char_id   = char_id
         self.char_name = char_name
         self._main_ui  = main_ui
         self.cfg       = cfg
+        # Sous-dictionnaire propre à ce pilote, créé au besoin. Tout ce qui est
+        # personnel (géométrie, sections repliées, thème, overlay) y va ; le
+        # reste de cfg est partagé par toute la flotte.
         self.char_cfg  = cfg.setdefault("chars", {}).setdefault(char_id, {})
         self.log_path  = cfg.get("log_path", DEF_PATH)
         self.poll_ms  = self.cfg.get("poll_ms",  DEF_POLL)
@@ -1574,41 +1915,81 @@ class CharacterWindow:
         self._dx = self._dy = 0
         self._st  = "stopped"
         self._main_hidden = False
-        self._is_collapsed = False  # Track window collapse state (double-click title)
-        self._full_height = 0       # Store height before collapse
-        self._main_frame = None     # Reference to body frame for collapse
-        self._dragging = False      # Distinguish drag vs double-click on titlebar
-        self._overlay_active = False  # True while a DPS overlay is open → don't suspend parsing
+        self._is_collapsed = False  # replié sur sa barre de titre (double-clic)
+        self._full_height = 0       # hauteur mémorisée avant repli
+        self._main_frame = None     # corps de la fenêtre, masqué au repli
+        # Un glissé commence par un clic : sans ce drapeau, déplacer la fenêtre
+        # déclencherait aussi le double-clic de repli.
+        self._dragging = False
+        # Un overlay ouvert garde le personnage en analyse même si sa fenêtre
+        # est masquée — sinon l'overlay afficherait un DPS figé.
+        self._overlay_active = False
         self.cf = log_file if log_file else None
         self.fh = None
         self.fp = 0
-        # Partial-line carry-over + last observed byte size. EVE flushes mid-line,
-        # so a read often ends on half a line; parsing that half as a complete
-        # line (and advancing past it) dropped or mangled the event. See _read().
+        # Report de ligne partielle et dernière taille observée. EVE vide son tampon
+        # en milieu de ligne : une lecture se termine donc souvent sur une demi-ligne,
+        # et la traiter comme complète (en avançant au-delà) perdait ou déformait
+        # l'événement. Voir _read().
         self._read_buf     = ""
         self._read_size    = -1
         self._read_seen_fp = None
         self._last_gamelog_scan = 0.0   # monotonic ts of last gamelog-rotation scan
-        self._sw  = None
         self._hw = None
         self._calc_dots = 0
-        self._poll_job = None        # after() id for the log-polling loop
-        self._tick_job = None        # after() id for the UI-refresh loop
-        self._alert_font_cache = {}  # size -> tkfont.Font, reused across redraws
+        # Identifiants after() des deux boucles, conservés pour pouvoir les
+        # annuler à la fermeture — sinon elles se déclencheraient sur des
+        # widgets détruits.
+        self._poll_job = None        # boucle de lecture des logs
+        self._tick_job = None        # boucle de rafraîchissement de l'UI
+        # Polices d'alerte réutilisées par taille : le feed se redessine souvent,
+        # et créer un objet Font par ligne à chaque passage coûte cher.
+        self._alert_font_cache = {}
 
-        # Clipboard tracker state
+        # État du suivi presse-papiers et des prix
         self._last_clipboard  = ""
         self._global_prices   = {}
-        self._jita_price_cache = {}     # Session cache for Jita lookups
+        # Cache Jita valable pour la session : un même objet revient souvent
+        # dans plusieurs cargaisons, et chaque appel coûte une requête réseau.
+        self._jita_price_cache = {}
         self._name_to_id_cache = self._load_nameid_cache()
 
-        # Loot loading indicator state
+        # État de l'indicateur d'estimation du loot
         self._loot_loading    = False
-        self._loot_inflight   = False   # one loot lookup at a time per window
+        # Une seule estimation à la fois par fenêtre : deux threads concurrents
+        # entrelaceraient l'animation du spinner et pourraient additionner deux
+        # fois la même cargaison.
+        self._loot_inflight   = False
         self._loot_anim_job   = None
         self._loot_anim_step  = 0
 
-        # ── Load or Download Market Prices (24h disk cache) ──
+        # Pile des imports de butin de la session : (montant, horodatage), le
+        # dernier en fin de liste. Sert au bouton UNDO — sans elle, une cargaison
+        # mal comptée restait coincée dans le total, l'ISK/heure et la ligne
+        # d'historique sauvegardée, sans aucun moyen de la retirer.
+        # Vidée par _reset(), donc RESET, NEXT SITE et toute nouvelle session
+        # repartent d'une pile propre.
+        self._loot_stack      = []
+        self._loot_undo_btn   = None   # bouton UNDO du breakdown
+        self._loot_hdr_lbl    = None   # en-tête « LOOT ESTIMATE », vire au rouge si verrouillé
+        self._clip_btn        = None   # bouton CLIP de la barre de contrôle
+
+        # Ajustement de largeur du breakdown (voir _brk_fit_row). Les cadres de
+        # rangée et leurs en-têtes sont mémorisés pour pouvoir MESURER la place
+        # réellement disponible à chaque tick, plutôt que de supposer 290 px.
+        self._brk_r1          = None   # rangée BOUNTIES / EST. TAXES / KILLS
+        self._brk_r3          = None   # rangée LOOT ESTIMATE / TOTAL NET
+        self._brk_r1_hdrs     = []
+        self._brk_r3_hdrs     = []
+        self._brk_hdr_font    = None
+        self._brk_val_font    = None
+        # Montants exacts du dernier rafraîchissement, servis par les infobulles
+        # quand la rangée a dû basculer sur la notation courte.
+        self._brk_exact: dict = {}
+
+        # Chargement des prix en tâche de fond : le catalogue ESI pèse plusieurs
+        # mégaoctets et bloquerait l'ouverture de la fenêtre. En daemon pour ne
+        # pas retarder la fermeture de l'app.
         threading.Thread(target=self._download_market_data, daemon=True).start()
 
         self._storyline_ctr = self.char_cfg.get("storyline_counter", 0)
@@ -1618,8 +1999,11 @@ class CharacterWindow:
         self._last_tick_wall: float = time.monotonic()
         self._session_saved = False
         self._anom_paused_secs = 0
-        self._anom_last_wall   = 0.0  # time.monotonic() of last combat event (timezone-immune gap detection)
-        self._anom_start_wall  = 0.0  # time.monotonic() when current anomaly started
+        # Horloge MONOTONE et non horodatage de log pour la détection de fin de
+        # site : une correction d'heure système clôturerait des anomalies au
+        # hasard, ou empêcherait de les clôturer du tout.
+        self._anom_last_wall   = 0.0  # dernier événement de combat
+        self._anom_start_wall  = 0.0  # début de l'anomalie en cours
         self._btn_sets = []
 
         self._isk_detached = False
@@ -1634,18 +2018,21 @@ class CharacterWindow:
         self._msn_det_labels = {}
         self._anom_det_labels = {}
 
-        # Section enabled states (ON/OFF) — per character, falling back to any
-        # legacy global value so existing configs migrate without surprises.
+        # Sections activées, par personnage. Le repli sur l'ancienne valeur
+        # globale sert la migration : les configs écrites avant le passage au
+        # par-personnage continuent de fonctionner sans rien perdre.
         self._isk_enabled  = self.char_cfg.get("isk_enabled",  self.cfg.get("isk_enabled",  True))
         self._msn_enabled  = self.char_cfg.get("msn_enabled",  self.cfg.get("msn_enabled",  True))
         self._anom_enabled = self.char_cfg.get("anom_enabled", self.cfg.get("anom_enabled", False))
 
-        # Enforce mutual exclusivity: if both ON, keep MSN, disable ANOM
+        # Missions et anomalies s'excluent : les deux décrivent « ce que le
+        # joueur est en train de faire » et se disputeraient la même place.
+        # En cas de conflit dans une vieille config, la mission gagne.
         if self._msn_enabled and self._anom_enabled:
             self._anom_enabled = False
             self.char_cfg["anom_enabled"] = False
 
-        # Section collapsed states (per character, legacy-global fallback)
+        # Sections repliées (même logique de migration que ci-dessus)
         self._isk_collapsed   = self.char_cfg.get("isk_collapsed",   self.cfg.get("isk_collapsed",   False))
         self._msn_collapsed   = self.char_cfg.get("msn_collapsed",   self.cfg.get("msn_collapsed",   False))
         self._anom_collapsed  = self.char_cfg.get("anom_collapsed",  self.cfg.get("anom_collapsed",  False))
@@ -1655,14 +2042,18 @@ class CharacterWindow:
         self._current_theme = self.char_cfg.get("theme", THEME_DEFAULT)
         apply_theme_colors(self._current_theme)
 
-        # OPTIMIZATION STATE
+        # Cache des dernières valeurs affichées, pour n'écrire dans un widget
+        # que lorsque son contenu change réellement (voir _cset).
         self._last_values = {}
 
         self._style()
         self._build()
 
+        # update_idletasks avant de lire ou poser la géométrie : sans ça, Tk
+        # n'a pas encore calculé la taille demandée par le contenu.
         self.root.update_idletasks()
-        # ── FULL GEOMETRY RESTORE (size + position) ──
+        # Restauration taille ET position : le joueur compose une disposition
+        # d'écran une fois et doit la retrouver telle quelle.
         saved_geom = self.char_cfg.get("geometry", "")
         if saved_geom and "+" in saved_geom:
             self.root.geometry(saved_geom)
@@ -1672,8 +2063,9 @@ class CharacterWindow:
         self.root.config(highlightbackground=BDG, highlightcolor=BDG, highlightthickness=1)
         self._fit()
 
-        # Restore collapsed state if window was closed while collapsed.
-        # winfo_* returns garbage while withdrawn — parse the geometry string instead.
+        # Restauration de l'état replié. La hauteur pleine est relue depuis la
+        # config plutôt que mesurée : la fenêtre est encore masquée à ce stade,
+        # et les winfo_* ne renvoient rien d'exploitable tant qu'elle l'est.
         full_h = self.char_cfg.get("main_full_height", 0)
         if self.char_cfg.get("main_collapsed", False) and full_h > 32:
             self._full_height = full_h
@@ -1702,22 +2094,26 @@ class CharacterWindow:
             self._detach("alert")
         self._start_minimized = self.char_cfg.get("main_minimized", False)
 
-    # ── Name-to-ID disk cache ────────────────────────────────────────
-    # Charge le cache nom→type_id depuis le disque
+    # ── Cache disque nom → type_id ─────────────────────────────────────
+    # Résoudre un nom d'objet en type_id coûte un appel ESI. Le cache rend ces
+    # identifiants permanents : ils ne changent jamais, donc une fois connus il
+    # n'y a plus jamais de raison de les redemander, même entre deux lancements.
     def _load_nameid_cache(self):
         if os.path.exists(NAMEID_CACHE):
             try:
                 with open(NAMEID_CACHE, "r", encoding="utf-8") as f:
                     return json.load(f)
             except Exception:
-                pass
+                _log_exc("CharacterWindow._load_nameid_cache:1652")
         return {}
 
     # Sauvegarde le cache nom→type_id sur le disque
     def _save_nameid_cache(self):
-        # Multiple loot threads (and multiple CharacterWindows) share one file.
-        # Merge under a lock so concurrent writers don't clobber each other's IDs,
-        # then write atomically so a reader never sees a half-written file.
+        # Plusieurs threads de loot, et plusieurs fenêtres de personnage, se
+        # partagent ce fichier unique. On fusionne sous verrou pour qu'un
+        # rédacteur n'efface pas les identifiants qu'un autre vient de résoudre,
+        # puis on écrit atomiquement : un lecteur ne doit jamais tomber sur un
+        # fichier à moitié écrit.
         with _NAMEID_LOCK:
             merged = {}
             if os.path.exists(NAMEID_CACHE):
@@ -1734,17 +2130,22 @@ class CharacterWindow:
                     json.dump(merged, f, ensure_ascii=False)
                 os.replace(tmp, NAMEID_CACHE)
             except Exception:
-                pass
+                _log_exc("CharacterWindow._save_nameid_cache:1676")
 
-    # ── Market data download (24h cache) ─────────────────────────────
-    # Télécharge les prix ESI (cache 24h sur disque)
+    # ── Prix du marché (cache 24 h) ────────────────────────────────────
+    # Catalogue de prix moyens de tout EVE, rafraîchi au plus une fois par jour :
+    # les prix bougent lentement à cette échelle, et le fichier pèse assez lourd
+    # pour qu'un téléchargement à chaque lancement soit pénible.
     def _download_market_data(self):
-        # Serialize across all CharacterWindows: only one thread fetches ESI and
-        # writes the shared cache; the others block, then load the file it wrote.
-        # This removes both the redundant N× downloads and the concurrent-write
-        # race that could corrupt ratting_prices.json.
+        # Sérialisé entre TOUTES les fenêtres : un seul thread interroge l'ESI
+        # et écrit le cache partagé, les autres attendent puis relisent ce
+        # qu'il a écrit. Sans ça, cinq personnages déclenchaient cinq
+        # téléchargements du même catalogue et cinq écritures concurrentes, qui
+        # laissaient ratting_prices.json corrompu.
         with _PRICE_LOCK:
-            # Use disk cache if less than 24h old
+            # Cache disque réutilisé s'il a moins de 24 h : les prix moyens
+            # bougent lentement, et le fichier est trop gros pour être
+            # retéléchargé à chaque lancement.
             if os.path.exists(PRICE_CACHE):
                 try:
                     age_hrs = (time.time() - os.path.getmtime(PRICE_CACHE)) / 3600
@@ -1753,9 +2154,9 @@ class CharacterWindow:
                             self._global_prices = json.load(f)
                         return
                 except Exception:
-                    pass
+                    _log_exc("CharacterWindow._download_market_data:1695")
 
-            # Download fresh from ESI
+            # Cache absent ou périmé : on redemande le catalogue complet.
             try:
                 req = urllib.request.Request(
                     "https://esi.evetech.net/latest/markets/prices/?datasource=tranquility",
@@ -1767,26 +2168,30 @@ class CharacterWindow:
                         for item in data
                     }
 
-                # Write atomically (temp file + os.replace) so a concurrent or
-                # next-launch reader never sees a half-written cache file.
+                # Écriture atomique (fichier temporaire puis os.replace) : ni
+                # un autre personnage au même instant, ni le prochain
+                # lancement, ne doit lire un cache tronqué.
                 tmp = PRICE_CACHE + ".tmp"
                 with open(tmp, "w", encoding="utf-8") as f:
                     json.dump(self._global_prices, f)
                 os.replace(tmp, PRICE_CACHE)
             except Exception:
-                pass
+                _log_exc("CharacterWindow._download_market_data:1716")
 
-    # ── Loot clipboard parsing ───────────────────────────────────────
-    # Vérifie si le presse-papiers contient un inventaire EVE à parser
+    # ── Estimation du loot par presse-papiers ──────────────────────────
+    # EVE n'écrit RIEN sur le loot dans ses logs : la seule façon d'en connaître
+    # la valeur est que le joueur copie sa cargaison (Ctrl+A, Ctrl+C), ce que
+    # l'app détecte en surveillant le presse-papiers. D'où ce chemin détourné.
     # Prend en charge un collage transmis par MainUI (qui lit le presse-papiers
     # une seule fois pour toute la flotte — voir MainUI._poll_clipboard).
     # Retourne True si cette fenêtre a bien démarré une estimation de loot.
     def _accept_clipboard(self, content):
         if self._st not in ("running", "paused"):
             return False
-        # One loot lookup at a time per window: if one is already running, refuse
-        # so the caller leaves _last_clipboard untouched and the paste is retried
-        # on a later poll (no concurrent threads, no spinner-state interleave).
+        # Une seule estimation à la fois par fenêtre : si une autre tourne, on
+        # refuse, l'appelant laisse _last_clipboard tel quel et le collage sera
+        # repris à un tour suivant. Évite deux threads concurrents sur la même
+        # cargaison et un spinner dont l'état s'entrelace.
         if self._loot_inflight:
             return False
         try:
@@ -1805,7 +2210,10 @@ class CharacterWindow:
     # sans MainUI (cas qui n'arrive pas dans l'app actuelle, mais _main_ui est
     # déclaré optionnel — on garde donc l'ancien comportement autonome).
     def _check_clipboard(self):
-        if not _CLIP_OK or self._st not in ("running", "paused"): return
+        # Même verrou que dans MainUI._poll_clipboard : ce chemin de repli lit
+        # le presse-papiers pour son propre compte, il doit donc le respecter
+        # aussi, sinon le verrou ne tiendrait pas sans MainUI.
+        if not _CLIP_OK or _CLIP_LOCK or self._st not in ("running", "paused"): return
         try:
             content = pyperclip.paste()
             if not content or "\t" not in content:
@@ -1815,10 +2223,77 @@ class CharacterWindow:
             if self._accept_clipboard(content):
                 self._last_clipboard = content
         except Exception:
-            pass
+            _log_exc("CharacterWindow._check_clipboard:1757")
 
-    # Parse le texte du presse-papiers et calcule la valeur du loot
+    # Le verrou est GLOBAL : on délègue à la MainUI, qui possède l'état partagé
+    # et rafraîchit tous les boutons d'un coup. Sans MainUI (fenêtre autonome),
+    # on bascule le drapeau nous-mêmes, avec le même instantané de presse-papiers
+    # au déverrouillage — sinon le texte encore présent serait avalé au tour
+    # suivant et le verrou n'aurait servi à rien.
+    def _toggle_clip_lock(self):
+        global _CLIP_LOCK
+        mu = getattr(self, "_main_ui", None)
+        if mu is not None:
+            try:
+                mu._set_clip_lock(not _CLIP_LOCK)
+                return
+            except Exception:
+                _log_exc("CharacterWindow._toggle_clip_lock:2210")
+        target = not _CLIP_LOCK
+        if not target and _CLIP_OK:
+            try:
+                self._last_clipboard = pyperclip.paste() or ""
+            except Exception:
+                _log_exc("CharacterWindow._toggle_clip_lock:2217")
+        _CLIP_LOCK = target
+        self._refresh_clip_btn()
+
+    def _refresh_clip_btn(self):
+        """Aligne le bouton CLIP sur l'état du verrou.
+
+        Le glyphe barré s'AJOUTE à la couleur : une nuance de rouge se rate d'un
+        coup d'oeil, et le prix d'un verrou oublié est une soirée de butin non
+        comptée. L'en-tête du breakdown porte le même avertissement.
+        """
+        if not self._clip_btn:
+            return
+        try:
+            if _CLIP_LOCK:
+                self._clip_btn.config(text="CLIP ⊘", fg=CS)
+            else:
+                self._clip_btn.config(text="CLIP", fg=CA)
+        except Exception:
+            _log_exc("CharacterWindow._refresh_clip_btn:2233")
+
+    # Tourne sur un thread de travail : la résolution des noms et les appels de
+    # prix peuvent prendre plusieurs secondes, ce qui figerait l'interface.
     def _process_loot_copy(self, text):
+        # Tourne sur un thread démon. TOUT ce qui suit doit rester sous garde :
+        # une exception qui s'échappait tuait le thread en silence, laissait
+        # _loot_inflight bloqué à True, et la fenêtre ignorait alors tous les
+        # collages suivants — spinner tournant indéfiniment — jusqu'au
+        # redémarrage de l'app.
+        total = 0
+        try:
+            total = self._value_loot_text(text)
+        except Exception:
+            total = 0
+        now_str = datetime.now().strftime("%H:%M:%S")
+        try:
+            if total > 0:
+                self.root.after(0, lambda amt=total, ts=now_str: self._apply_loot(amt, ts))
+            else:
+                # Nothing valued — stop spinner without flashing green
+                self.root.after(0, lambda: self._loot_anim_stop(False))
+        except Exception:
+            # Racine déjà détruite (fenêtre fermée pendant l'estimation) : plus
+            # de thread principal pour exécuter _loot_anim_stop, on libère donc
+            # le verrou directement.
+            self._loot_inflight = False
+            self._loot_loading  = False
+
+    # Calcule la valeur totale d'un collage d'inventaire (thread de travail).
+    def _value_loot_text(self, text):
         lines = text.strip().split('\n')
         total_session_loot = 0
         parsed_items = []
@@ -1840,14 +2315,19 @@ class CharacterWindow:
                 if name not in self._name_to_id_cache:
                     names_to_resolve.add(name)
 
-        # Resolve newly copied Item Names to Type IDs in bulk via ESI
+        # Resolve newly copied Item Names to Type IDs in bulk via ESI.
+        # resolve_failed distingue « la REQUÊTE a échoué » (réseau) de « l'ESI a
+        # répondu que ce n'est pas un objet ». Les deux appellent un traitement
+        # différent plus bas : sans cette distinction, un nom inconnu se
+        # verrait attribuer un prix comme s'il s'agissait de butin.
+        resolve_failed = False
         if names_to_resolve:
             names_list = list(names_to_resolve)
             for i in range(0, len(names_list), 500):
                 chunk = names_list[i:i+500]
                 try:
                     data = json.dumps(chunk).encode('utf-8')
-                    req = urllib.request.Request("https://esi.evetech.net/latest/universe/ids/", data=data, 
+                    req = urllib.request.Request("https://esi.evetech.net/latest/universe/ids/", data=data,
                                                  headers={'Content-Type': 'application/json', 'Accept-Language': 'en',
                                                           'User-Agent': _ESI_UA})
                     with urllib.request.urlopen(req, timeout=5) as response:
@@ -1855,42 +2335,45 @@ class CharacterWindow:
                         for item in res.get('inventory_types', []):
                             self._name_to_id_cache[item['name']] = item['id']
                 except Exception:
-                    pass
+                    resolve_failed = True
             self._save_nameid_cache()
-        
-        # Price calc: Jita for faction items, global avg for everything else
+
+        # Prix : Jita pour les objets de faction (ils valent assez cher pour
+        # justifier une requête), moyenne globale déjà en cache pour le reste.
         for item in parsed_items:
             name = item["name"]
             qty = item["qty"]
             type_id = self._name_to_id_cache.get(name)
-            
+
             price = 0
             if type_id:
                 if RE_FACTION_ITEM.search(name):
                     price = self._get_live_esi_price(type_id)
                 else:
                     price = self._global_prices.get(str(type_id), 0)
-            
-            # Offline Fallback if ESI entirely fails
-            if price == 0:
+                # Objet EVE reconnu mais sans prix de marché — on estime
+                # d'après son nom.
+                if price == 0:
+                    price = self._get_avg_loot_price_fallback(name)
+            elif resolve_failed:
+                # ESI injoignable : impossible de savoir si c'est un objet du
+                # jeu. On suppose que oui et on estime, comme avant.
                 price = self._get_avg_loot_price_fallback(name)
-                
-            total_session_loot += (price * qty)
-        
-        now_str = datetime.now().strftime("%H:%M:%S")
-        # Marshal the result back to the main thread. Guard against the window
-        # being closed mid-lookup (self.root destroyed → after() would raise
-        # TclError in this daemon thread).
-        try:
-            if total_session_loot > 0:
-                self.root.after(0, lambda amt=total_session_loot, ts=now_str: self._apply_loot(amt, ts))
-            else:
-                # Nothing valued — stop spinner without flashing green
-                self.root.after(0, lambda: self._loot_anim_stop(False))
-        except Exception:
-            pass
+            # sinon : l'ESI a répondu et ne reconnaît pas ce nom — ce n'est pas
+            # un objet d'inventaire, donc il ne vaut rien. N'importe quel texte
+            # contenant une tabulation arrive jusqu'ici (une ligne de tableur,
+            # un tableau copié d'une page web), et l'estimation de repli
+            # renvoie 200 000 pour TOUT nom inconnu : les compter inventerait
+            # de l'ISK dans le total de session.
 
-    # Bip d'alerte EWAR — Windows uniquement, joué hors du thread UI (non bloquant).
+            total_session_loot += (price * qty)
+
+        return total_session_loot
+
+    # Le son est le seul canal qui fonctionne quand le joueur regarde le jeu et
+    # non la fenêtre : scram et web sont précisément les événements qu'il ne
+    # faut pas rater. Joué dans un thread parce que winsound.Beep BLOQUE le
+    # temps du bip — sur le thread UI, l'app se figerait à chaque alerte.
     def _ewar_sound(self):
         if not _SND_OK:
             return
@@ -1899,13 +2382,14 @@ class CharacterWindow:
                 winsound.Beep(1200, 130)
                 winsound.Beep(1650, 160)
             except Exception:
-                pass
+                _log_exc("CharacterWindow._ewar_sound._beep:1866")
         try:
             threading.Thread(target=_beep, daemon=True).start()
         except Exception:
-            pass
+            _log_exc("CharacterWindow._ewar_sound:1870")
 
-    # Pulse visuel sur le cadre d'alerte (pour les événements EWAR)
+    # Complément visuel du bip, pour le joueur qui coupe le son ou joue en
+    # musique. Le clignotement attire l'œil là où l'alerte vient de s'écrire.
     def _flash_alert(self):
         self._ewar_sound()
 
@@ -1913,7 +2397,8 @@ class CharacterWindow:
         def _pulse(step=0):
             if step < 3:
 
-                # Alternate between highlight and normal
+                # Alternance clair / normal : c'est le clignotement qui attire
+                # l'œil, pas la couleur elle-même.
                 bg = BDG if step % 2 == 0 else BG_P
                 try:
                     self._alert_frame.config(bg=bg)
@@ -1922,11 +2407,11 @@ class CharacterWindow:
                         for c in w.winfo_children():
                             c.config(bg=bg)
                 except Exception:
-                    pass
+                    _log_exc("CharacterWindow._flash_alert._pulse:1889")
                 try:
                     self.root.after(150, lambda: _pulse(step + 1))
                 except Exception:
-                    pass   # root torn down mid-flash — stop the pulse chain
+                    _log_exc("CharacterWindow._flash_alert._pulse:1893")   # root torn down mid-flash — stop the pulse chain
             else:
 
                 # Reset to normal
@@ -1937,25 +2422,95 @@ class CharacterWindow:
                         for c in w.winfo_children():
                             c.config(bg=BG_P)
                 except Exception:
-                    pass
+                    _log_exc("CharacterWindow._flash_alert._pulse:1904")
         _pulse()
 
-    # Applique la valeur de loot calculée aux données de session (thread principal)
+    # Repasse sur le THREAD PRINCIPAL via after() : Tk n'est pas thread-safe, et
+    # écrire dans les widgets depuis le thread de loot corromprait l'affichage.
     def _apply_loot(self, amount, now_str):
 
-        # Stop spinner and flash green to confirm the find
+        # Arrêt du spinner et éclat vert : confirme visuellement que la
+        # cargaison a bien été prise en compte.
         self._loot_anim_stop(True)
 
         # Main thread — safe to update data + UI
         self.data.loot_val += amount
+        # Empilé AVANT l'alerte : _undo_last_loot retrouve la ligne du fil par son
+        # horodatage, les deux doivent donc porter exactement le même.
+        self._loot_stack.append((amount, now_str))
         self._add_loot_alert(now_str, amount)
+        self._refresh_undo_btn()
 
-    # Récupère le prix Jita minimum depuis ESI (cache session par item)
+    # Retire le dernier import de butin. Existe parce qu'un simple Ctrl+C sur
+    # autre chose qu'une cargaison (un contrat, une ligne de marché, une
+    # cargaison qu'on voulait seulement faire estimer ailleurs) injectait de
+    # l'ISK définitivement coincé dans le total, l'ISK/heure et l'historique.
+    def _undo_last_loot(self):
+        # Refus pendant une estimation : le thread de travail est sur le point
+        # d'ajouter un montant, défaire maintenant retirerait le mauvais.
+        if self._loot_inflight or not self._loot_stack:
+            return
+
+        amount, ts = self._loot_stack.pop()
+        d = self.data
+        # Plancher à zéro : un RESET concurrent a pu remettre le total à plat,
+        # et un total négatif contaminerait l'ISK/heure et la ligne d'historique.
+        d.loot_val = max(0, d.loot_val - amount)
+
+        # Retrait de la ligne correspondante dans le fil d'alertes. Son absence
+        # est NORMALE, pas une anomalie : le fil est plafonné à MAX_ALERTS et le
+        # bouton CLR le vide entièrement.
+        try:
+            for i in range(len(d.alerts) - 1, -1, -1):
+                if d.alerts[i][0] == ts and d.alerts[i][1] == "LOOT":
+                    del d.alerts[i]
+                    break
+            self._update_alert_labels()
+        except Exception:
+            _log_exc("CharacterWindow._undo_last_loot:2395")
+
+        # Éclat rouge, miroir de l'éclat vert de confirmation d'un import réussi.
+        try:
+            self._cset(self.ll, fg=CS)
+            self.root.after(500, self._loot_label_restore_fg)
+        except Exception:
+            _log_exc("CharacterWindow._undo_last_loot:2402")
+
+        # Les totaux de flotte et TOTAL NET dérivent de loot_val à chaque tick :
+        # rien de plus à faire pour eux.
+        self._refresh_undo_btn()
+
+    def _refresh_undo_btn(self):
+        """Active ou éteint le bouton UNDO selon que la pile est vide ou non."""
+        btn = self._loot_undo_btn
+        if not btn:
+            return
+        try:
+            if self._loot_stack:
+                btn.config(fg=CS, cursor="hand2")
+            else:
+                btn.config(fg=TD, cursor="")
+        except Exception:
+            _log_exc("CharacterWindow._refresh_undo_btn:2416")
+
+    # Prix de vente le plus bas à Jita, plus proche du prix réellement obtenu
+    # qu'une moyenne globale — ça vaut le coup pour les objets de faction, qui
+    # représentent l'essentiel de la valeur d'une cargaison de ratting.
     def _get_live_esi_price(self, type_id):
 
-        # Session cache — one Jita lookup per item max
-        if type_id in self._jita_price_cache:
-            return self._jita_price_cache[type_id]
+        # Cache de session — au plus une requête Jita par objet. Chaque entrée
+        # vaut (prix, provisoire, horodatage) : un vrai prix Jita est conservé
+        # toute la session, mais une estimation écrite après un ÉCHEC n'est que
+        # provisoire et sera réessayée après PROVISIONAL_TTL.
+        # Auparavant, un seul dépassement de délai ESI figeait définitivement
+        # l'estimation de repli, et l'objet restait mal évalué jusqu'au
+        # redémarrage.
+        PROVISIONAL_TTL = 60
+        hit = self._jita_price_cache.get(type_id)
+        if hit is not None:
+            price, provisional, stamped = hit
+            if not provisional or (time.monotonic() - stamped) < PROVISIONAL_TTL:
+                return price
         try:
             time.sleep(0.5)  # Throttle: max ~2 requests/sec to ESI
             url = f"https://esi.evetech.net/latest/markets/10000002/orders/?datasource=tranquility&order_type=sell&type_id={type_id}"
@@ -1964,15 +2519,20 @@ class CharacterWindow:
                 orders = json.loads(response.read().decode())
                 if orders:
                     price = min(order['price'] for order in orders)
-                    self._jita_price_cache[type_id] = price
+                    self._jita_price_cache[type_id] = (price, False, time.monotonic())
                     return price
         except Exception:
-            pass
+            _log_exc("CharacterWindow._get_live_esi_price:1943")
+        # Pas de cotation (panne réseau, ou réellement aucun ordre de vente) :
+        # provisoire, donc réessayable.
         fallback = self._global_prices.get(str(type_id), 0)
-        self._jita_price_cache[type_id] = fallback
+        self._jita_price_cache[type_id] = (fallback, True, time.monotonic())
         return fallback
 
-    # Retourne un prix de fallback hors-ligne par nom d'item
+    # Estimation grossière par mot-clé, utilisée quand l'ESI est injoignable :
+    # une valeur approximative vaut mieux qu'un zéro qui laisserait croire que
+    # la cargaison ne vaut rien. N'est appliquée qu'à des objets EVE reconnus —
+    # sur un texte quelconque elle inventerait de l'ISK (voir _value_loot_text).
     def _get_avg_loot_price_fallback(self, name):
 
         # Offline price fallback if API fails
@@ -1990,13 +2550,18 @@ class CharacterWindow:
     # Ajoute une alerte de loot au feed d'alertes
     def _add_loot_alert(self, now_str, amount):
 
-        # Add loot alert to the feed
+        # Trace dans le fil d'alertes : le montant s'ajoute au total, et le
+        # joueur doit pouvoir vérifier ce qui a été compté.
         self.data.alerts.append((now_str, "LOOT", f"Added {fisk(amount)} loot"))
         # Refresh alert display
         self._update_alert_labels()
 
-    # ── Loot loading animation (main thread only) ─────────────────────
+    # ── Animation d'estimation (thread principal) ──────────────────────
 
+    # Le spinner existe parce que l'estimation peut durer plusieurs secondes :
+    # sans retour visible, le joueur croit que son collage a été ignoré et
+    # recommence. Il tourne sur le label de loot lui-même, là où le résultat
+    # apparaîtra.
     def _loot_anim_start(self):
         """Begin spinning 'Searching…' on the LOOT ESTIMATE label."""
         self._loot_loading   = True
@@ -2007,57 +2572,57 @@ class CharacterWindow:
         self._loot_anim_tick()
 
     def _loot_anim_tick(self):
-        """Advance one spinner frame (reschedules itself while loading)."""
+        """Avance d'une image du spinner et se replanifie tant que l'estimation dure."""
         if not self._loot_loading:
             return
         try:
             spin = _LOOT_SPIN[self._loot_anim_step % len(_LOOT_SPIN)]
-            self.ll.config(text=f"{spin} Searching...", fg=CW)
+            self._cset(self.ll, text=f"{spin} Searching...", fg=CW)
         except Exception:
-            pass
+            _log_exc("CharacterWindow._loot_anim_tick:1991")
         self._loot_anim_step += 1
         self._loot_anim_job = self.root.after(120, self._loot_anim_tick)
 
     def _loot_anim_stop(self, found):
-        """Stop the spinner.  If found=True, flash bright green then restore."""
+        """Arrête le spinner. found=True déclenche un éclat vert de confirmation :
+        sans lui, rien ne distingue « estimation terminée » de « rien trouvé »."""
         self._loot_loading = False
         self._loot_inflight = False   # release the guard so the next paste can process
         if self._loot_anim_job:
             self.root.after_cancel(self._loot_anim_job)
             self._loot_anim_job = None
         if found:
-            try:
-                self.ll.config(fg="#39FF14")   # bright-green confirmation flash
-            except Exception:
-                pass
+            self._cset(self.ll, fg="#39FF14")   # éclat vert de confirmation
             self.root.after(500, lambda: self._loot_label_restore_fg())
         else:
             self._loot_label_restore_fg()
 
     def _loot_label_restore_fg(self):
-        """Restore the loot label to its normal colour."""
-        try:
-            self.ll.config(fg=CI)
-        except Exception:
-            pass
+        """Rend au label de loot sa couleur normale après l'éclat vert."""
+        self._cset(self.ll, fg=CI)
 
-    # ── Resize main window to fit content ────────────────────────────
-    # Redimensionne la fenêtre principale pour s'adapter au contenu
+    # ── Ajustement de la fenêtre au contenu ──────────────────────────────
+    # La fenêtre grandit et rétrécit selon les sections actives : activer le
+    # suivi d'anomalies ou replier le détail doit changer sa taille tout de
+    # suite. Sans cet ajustement, une section masquée laisserait un vide.
     def _fit(self):
         self.root.update_idletasks()
-        self.root.update_idletasks()  # second pass needed on Linux/X11 for nested frame heights
-        # +32 header. Also add the bottom status bar's height, otherwise the
-        # resize grip gets clipped off the bottom edge of the window.
+        # Deuxième passe nécessaire sous Linux/X11 : la hauteur des cadres
+        # imbriqués n'est correcte qu'au second calcul.
+        self.root.update_idletasks()
+        # +32 pour l'en-tête, plus la hauteur de la barre d'état : sans elle, la
+        # poignée se retrouve coupée par le bord bas de la fenêtre.
         h = self._body.winfo_reqheight() + 32
         if getattr(self, "_grip_bar", None) is not None:
-            h += 16   # status bar / resize grip
+            h += 16   # barre d'état et poignée
 
-        # While collapsed the body is hidden and the window is pinned at 32px.
-        # Resizing it to the (still full) content height would leave blank space
-        # under the title bar — the exact glitch seen when a detached panel is
-        # re-attached while collapsed. Instead, just remember the new full height
-        # so the next expand restores the correct size (incl. the re-attached
-        # section), then leave the collapsed window untouched.
+        # Repliée, la fenêtre est bloquée à 32 px et son corps masqué. La
+        # redimensionner à la hauteur (toujours pleine) du contenu laisserait
+        # une bande vide sous la barre de titre — exactement le défaut qu'on
+        # voyait en rattachant un panneau détaché pendant que la fenêtre était
+        # repliée. On se contente donc de MÉMORISER la nouvelle hauteur pleine,
+        # pour que le prochain dépliage restaure la bonne taille (section
+        # rattachée comprise), et on laisse la fenêtre repliée intacte.
         if self._is_collapsed:
             self._full_height = h
             self.char_cfg["main_full_height"] = h
@@ -2066,21 +2631,25 @@ class CharacterWindow:
         saved = self.char_cfg.get("geometry", "")
         if saved:
             saved_w = saved.split("x")[0] if "x" in saved else str(WIN_W)
-            # re.sub replaces only the WxH size portion, preserving ±X±Y as-is
+            # re.sub ne remplace que la partie LxH et laisse ±X±Y intact : la
+        # position ne doit pas bouger quand seule la hauteur change.
             new_geom = re.sub(r"^\d+x\d+", f"{saved_w}x{h}", saved)
             self.root.geometry(new_geom)
         else:
             self.root.geometry(f"{WIN_W}x{h}")
             self._center()
 
-    # Centre la fenêtre sur le bord droit de l'écran
+    # Position par défaut au bord DROIT, pas au centre : l'UI d'EVE occupe le
+    # centre de l'écran, et une fenêtre qui s'ouvrirait dessus masquerait le
+    # jeu à chaque premier lancement.
     def _center(self):
         self.root.update_idletasks()
         x = self.root.winfo_screenwidth()  - WIN_W - 20
         y = (self.root.winfo_screenheight() - self.root.winfo_height()) // 2
         self.root.geometry(f"+{x}+{y}")
 
-    # Mémorise la position de début de glisser
+    # Glisser réimplémenté à la main : la fenêtre est en overrideredirect, donc
+    # elle n'a pas de barre de titre système pour la déplacer.
     def _sd(self, e):
         self._dx, self._dy = e.x, e.y
         self._dragging = False
@@ -2094,12 +2663,16 @@ class CharacterWindow:
     # Finalise le glisser et sauvegarde la position
     def _dd_end(self, e):
         self._save_pos()
-        # Reset dragging flag after short delay so double-click guard works correctly
+        # Drapeau remis à zéro avec un léger différé : le double-clic arrive
+        # après le relâchement, et sans ce délai il serait pris pour un glissé.
         self.root.after(100, lambda: setattr(self, '_dragging', False))
 
-    # Collapse/déplie la fenêtre sur double-clic de la barre de titre
+    # Replie la fenêtre sur sa seule barre de titre. Sert pendant un trajet ou
+    # une pause : on garde le personnage sous la main sans lui laisser occuper
+    # l'écran. La hauteur pleine est mémorisée pour pouvoir la restaurer.
     def _toggle_window_collapse(self, event):
-        # Don't collapse if we were just dragging
+        # Un déplacement se termine aussi par un relâchement : sans ce test,
+        # bouger la fenêtre la replierait au passage.
         if getattr(self, '_dragging', False):
             return
         # Cooldown to prevent rapid double-clicks triggering multiple toggles
@@ -2128,7 +2701,8 @@ class CharacterWindow:
             self.char_cfg["main_collapsed"] = False
             save_config(self.cfg)
         else:
-            # Collapse — hide content, show mini controls in title bar
+            # Repli : on masque le corps et on fait apparaître les contrôles
+            # réduits dans la barre de titre, pour garder Play/Pause à portée.
             self._full_height = self.root.winfo_height()
             self._main_frame.pack_forget()
             if hasattr(self, "_grip_bar"):
@@ -2155,7 +2729,7 @@ class CharacterWindow:
                     self.char_cfg["main_full_height"] = h
             save_config(self.cfg)
         except Exception:
-            pass
+            _log_exc("CharacterWindow._save_pos:2126")
 
     def _resize_start(self, e):
         self._rw = self.root.winfo_width()
@@ -2173,7 +2747,9 @@ class CharacterWindow:
     def _resize_end(self, e):
         self._save_pos()
 
-    # Configure le style TTK (combobox thème EVE)
+    # Les widgets ttk (ici la combobox) ne suivent pas les couleurs passées aux
+    # widgets tk classiques : il faut leur déclarer un style à part, sinon la
+    # liste déroulante reste en gris Windows au milieu d'une UI sombre.
     def _style(self):
         s = ttk.Style()
         s.theme_use("clam")
@@ -2186,7 +2762,10 @@ class CharacterWindow:
               foreground=[("readonly", TB)],
               bordercolor=[("focus", BDG)])
 
-    # Construit l'interface principale (en-tête, contrôles, sections)
+    # Construit toute l'interface une fois pour toutes. Les mises à jour
+    # suivantes ne font que réécrire le texte des labels existants : on ne
+    # reconstruit jamais de widgets en cours de session, car sur une surcouche
+    # toujours au premier plan, cela produit un clignotement très visible.
     def _build(self):
         hdr = tk.Frame(self.root, bg=BG_H, height=30)
         hdr.pack(fill="x")
@@ -2229,7 +2808,8 @@ class CharacterWindow:
         hb.bind("<Leave>", lambda e: hb.config(fg=btn_fg))
         Tooltip(hb, "History")
 
-        # Mini controls \u2014 visible only when window is collapsed
+        # Contrôles réduits, visibles uniquement fenêtre repliée : on doit
+        # pouvoir mettre en pause sans avoir à déplier.
         MF  = tkfont.Font(family="Consolas", size=10, weight="bold")
         MF7 = tkfont.Font(family="Consolas", size=7,  weight="bold")
         self._hdr_b_go = tk.Label(hdr, text="\u25b6",       fg=CA, font=MF,  bg=BG_H, padx=4, cursor="hand2")
@@ -2241,12 +2821,15 @@ class CharacterWindow:
         self._hdr_b_st = tk.Label(hdr, text="\u25a0",       fg=TD, font=MF,  bg=BG_H, padx=4, cursor="hand2")
         self._hdr_b_st.bind("<Button-1>", lambda e: self._stop())
         Tooltip(self._hdr_b_st, "Stop")
-        # Register as a btn_set so _update_buttons keeps them in sync
+        # Enregistrés comme jeu de boutons : _update_buttons les recolore en
+        # même temps que les autres, sinon les deux jeux divergeraient.
         self._hdr_btn_set = {"go": self._hdr_b_go, "pa": self._hdr_b_pa, "st": self._hdr_b_st}
         self._btn_sets.append(self._hdr_btn_set)
-        # Don't pack yet \u2014 shown only when collapsed
+        # Pas encore affichés — ils n'apparaissent qu'au repli.
 
-        # Every child of the title bar is also a drag handle (append \u2014 existing bindings still fire)
+        # Chaque enfant de la barre de titre sert aussi de poignée : sans ça,
+        # cliquer sur le texte du titre ne déplacerait pas la fenêtre.
+        # Ajout (add="+") pour ne pas écraser les liaisons déjà posées.
         for _w in hdr.winfo_children():
             _w.bind("<Button-1>",        self._sd,    "+")
             _w.bind("<B1-Motion>",       self._dd,    "+")
@@ -2289,14 +2872,16 @@ class CharacterWindow:
         self._anom_container.grid(row=7, column=0, sticky="ew")
         self._build_anomalies(self._anom_container)
 
-        # DPS MONITOR section removed — DPS now lives in the standalone overlay.
-        # The bottom of the dashboard is a minimal status bar: just the resize grip.
+        # La section DPS a disparu du tableau de bord : elle vit désormais dans
+        # l'overlay autonome, bien plus utile posée sur le jeu. Le bas de la
+        # fenêtre se réduit donc à une barre d'état minimale.
 
-        # ── Status bar (bottom): a slim visible bar with a decorative grip. ──
-        # Panel-coloured so it reads as a bar against the darker content area.
-        # The character window auto-fits its content and is NOT user-resizable;
-        # the grip glyph is kept purely for visual consistency with the Overview
-        # (no drag-to-resize bindings, and no resize cursor).
+        # ── Barre d'état (bas) : bande fine avec une poignée décorative ──
+        # Teintée comme un panneau pour se détacher de la zone de contenu.
+        # La fenêtre de personnage s'ajuste à son contenu et n'est PAS
+        # redimensionnable : la poignée n'est là que par cohérence visuelle avec
+        # la vue d'ensemble — aucune liaison de glissé, aucun curseur de
+        # redimensionnement.
         self._grip_bar = tk.Frame(self.root, bg=BG_P, height=16)
         self._grip_bar.pack(fill="x", side="bottom")
         self._grip_bar.pack_propagate(False)
@@ -2306,7 +2891,10 @@ class CharacterWindow:
                           bg=BG_P, fg=T1)
         grip_l.pack(side="right", padx=4)
 
-    # Construit la barre de contrôle (Play/Pause/Stop/Reset + combobox de personnage)
+    # Barre de contrôle. Le découpage Play / Pause / Stop existe parce que les
+    # trois répondent à des situations différentes : Pause fige le chrono le
+    # temps d'un trajet, Stop gèle l'affichage pour lire les totaux, Reset
+    # archive la session et repart de zéro.
     def _build_controls(self, parent):
         pad = dict(padx=6, pady=2)
         F12 = tkfont.Font(family="Consolas", size=12, weight="bold")
@@ -2345,12 +2933,32 @@ class CharacterWindow:
         self._b_ns.bind("<Leave>",    lambda e: self._b_ns.config(bg=BG_P))
         Tooltip(self._b_ns, "Save session, complete site & reset")
 
+        # Verrou de presse-papiers, à côté de RESET / NEXT SITE plutôt que dans
+        # l'en-tête : celui-ci est déjà chargé, ces deux-là sont exactement le
+        # même idiome de bouton texte, et c'est ici que la main du joueur se
+        # trouve déjà en pleine session. L'état est GLOBAL, pas propre à ce
+        # personnage — tous les boutons montrent le même verrou.
+        self._clip_btn = tk.Label(ctrl_wrap, text="CLIP", fg=CA, font=F8B, bg=BG_P,
+                                  cursor="hand2", bd=0, padx=6)
+        self._clip_btn.pack(side="left")
+        self._clip_btn.bind("<Button-1>", lambda e: self._toggle_clip_lock())
+        self._clip_btn.bind("<Enter>",    lambda e: self._clip_btn.config(bg=BDG))
+        self._clip_btn.bind("<Leave>",    lambda e: self._clip_btn.config(bg=BG_P))
+        DynamicTooltip(self._clip_btn,
+                       lambda: ("Clipboard LOCKED - loot copies ignored (click to resume)"
+                                if _CLIP_LOCK else
+                                "Clipboard live - click to lock before copying a fit or appraisal"))
+        self._refresh_clip_btn()
+
         self._main_btn_set = {"go": self._b_go, "pa": self._b_pa, "st": self._b_st}
         self._btn_sets.append(self._main_btn_set)
         self._update_buttons()
 
 
-    # Construit la section d'alertes avec son en-tête et feed
+    # Fil d'alertes : scram, web, escalade, dreadnought, loot. Volontairement
+    # court (MAX_ALERTS) — c'est un fil d'événements récents, pas un journal ;
+    # au-delà, l'important se noie dans l'ancien et la fenêtre s'allonge.
+    # Le paramètre detached ajuste la mise en page pour la version flottante.
     def _build_alerts(self, parent, detached=False):
         F8  = tkfont.Font(family="Consolas", size=8)
         F8B = tkfont.Font(family="Consolas", size=8, weight="bold")
@@ -2387,7 +2995,8 @@ class CharacterWindow:
             self._alert_tog_btn.bind("<Enter>", lambda e: self._alert_tog_btn.config(fg=TB))
             self._alert_tog_btn.bind("<Leave>", lambda e: self._alert_tog_btn.config(fg=TD))
         else:
-            # Detached header has CLR button too
+            # Le bouton CLR est repris dans l'en-tête détaché : vider le fil doit rester
+            # possible sans revenir à la fenêtre principale.
             hdr_f = tk.Frame(parent, bg=BG_P, height=20)
             hdr_f.pack(fill="x")
             hdr_f.pack_propagate(False)
@@ -2418,7 +3027,8 @@ class CharacterWindow:
         self.data.alerts.clear()
         self._last_alert_key = None  # Force redraw
 
-    # Adapte la taille de police quand la fenêtre alerte détachée est redimensionnée
+    # Détaché, le fil d'alertes peut être agrandi librement : la police suit
+    # pour rester lisible à distance, un panneau posé sur un second écran.
     def _on_alert_detached_resize(self, event):
         if not self._alert_detached:
             return
@@ -2430,15 +3040,20 @@ class CharacterWindow:
         scale = max(0.8, min(2.5, h / base_h))
         new_size = max(8, min(16, int(base_size * scale)))
         
-        # Only update if size changed
+        # Uniquement si la taille a changé : ce gestionnaire se déclenche à chaque
+        # pixel de glissé, et recalculer la police à chaque fois rendrait le
+        # redimensionnement saccadé.
         if hasattr(self, '_alert_det_font_size') and self._alert_det_font_size == new_size:
             return
         self._alert_det_font_size = new_size
         
-        # Force redraw with new font size
+        # Redessin forcé : changer la taille d'une police ne suffit pas à faire
+        # recalculer leur mise en page aux widgets déjà disposés.
         self._last_alert_key = None
 
-    # Construit la section ISK Tracker (ISK/h, timer, breakdown)
+    # Section ISK : la raison d'être de l'app. L'ISK/heure est le seul chiffre
+    # qui permette de comparer deux vaisseaux, deux sites ou deux systèmes,
+    # puisqu'il ramène tout à la même unité de temps.
     def _build_isk(self, parent, detached=False):
         F8  = tkfont.Font(family="Consolas", size=8)
         F7B = tkfont.Font(family="Consolas", size=7, weight="bold")
@@ -2446,7 +3061,8 @@ class CharacterWindow:
         pad = dict(padx=6, pady=(2, 4))
 
         # ── Header: [accent] [ISK TRACKER] [ON/OFF] ... [▼/▶] [↱] ──
-        # Skip header when detached — DetachedWindow provides its own
+        # Pas d'en-tête en version détachée : DetachedWindow fournit déjà le sien,
+        # et deux barres de titre superposées seraient absurdes.
         if not detached:
             hdr_f = tk.Frame(parent, bg=BG_P, height=20)
             hdr_f.pack(fill="x")
@@ -2539,31 +3155,48 @@ class CharacterWindow:
         # Breakdown content
         self._build_breakdown_content(self._brk_wrap)
 
-    # Construit le contenu du sous-panneau breakdown ISK
+    # Le détail (brut, taxes, kills, loot) explique COMMENT on arrive au net.
+    # Repliable parce qu'on ne le consulte qu'en fin de session : pendant le
+    # combat, seul l'ISK/heure compte.
     def _build_breakdown_content(self, brk_wrap):
         F8  = tkfont.Font(family="Consolas", size=8)
+        # Une seule police de valeur partagée par les cinq labels, au lieu d'un
+        # objet Font par label : _brk_fit_row doit mesurer avec EXACTEMENT la
+        # police utilisée à l'écran, et une référence unique le garantit.
+        FVAL = tkfont.Font(family="Consolas", size=11, weight="bold")
+        self._brk_hdr_font = F8
+        self._brk_val_font = FVAL
+        self._brk_r1_hdrs  = []
+        self._brk_r3_hdrs  = []
 
         r1 = tk.Frame(brk_wrap, bg=BG_P)
         r1.pack(fill="x")
+        self._brk_r1 = r1
         for idx, (lbl_text, c) in enumerate([("BOUNTIES", CG), ("EST. TAXES", CT), ("KILLS", CG)]):
             f = tk.Frame(r1, bg=BG_P)
             f.pack(side="left", expand=True, fill="x")
-            
+
             # Align: 0=Left(w), 1=Center(center), 2=Right(e)
             align = "w" if idx == 0 else ("center" if idx == 1 else "e")
-            
+
             hdr_l = tk.Label(f, text=lbl_text, font=F8, bg=BG_P, fg=TD)
             hdr_l.pack(anchor=align)
+            self._brk_r1_hdrs.append(hdr_l)
             l = tk.Label(f, text="0" if lbl_text == "KILLS" else "0 ISK",
-                         font=tkfont.Font(family="Consolas", size=11, weight="bold"), bg=BG_P, fg=c)
+                         font=FVAL, bg=BG_P, fg=c)
             l.pack(anchor=align)
-            
+
             if lbl_text == "BOUNTIES":
                 self.gl = l
+                DynamicTooltip(l, lambda: self._brk_exact.get("gross", "—"))
             elif lbl_text == "EST. TAXES":
                 self.tl = l
                 DynamicTooltip(hdr_l, lambda: f"Corp Tax: {self.tax_var.get()}%")
-                DynamicTooltip(l,     lambda: f"Corp Tax: {self.tax_var.get()}%")
+                # Infobulle fusionnée et non deux DynamicTooltip empilés : chacun
+                # crée son propre Toplevel à la même position, et deux bulles
+                # superposées ne laissent lire que celle du dessus.
+                DynamicTooltip(l, lambda: (f"Corp Tax: {self.tax_var.get()}%\n"
+                                           f"{self._brk_exact.get('taxes', '—')}"))
             else:
                 self.bl = l
 
@@ -2571,23 +3204,95 @@ class CharacterWindow:
 
         r3 = tk.Frame(brk_wrap, bg=BG_P)
         r3.pack(fill="x")
+        self._brk_r3 = r3
         for idx, (lbl_text, c) in enumerate([("LOOT ESTIMATE (CTRL+C)", CI), ("TOTAL NET (+LOOT)", CI)]):
             f = tk.Frame(r3, bg=BG_P)
             f.pack(side="left", expand=True, fill="x")
-            
+
             # Align: 0=Left(w), 1=Right(e)
             align = "w" if idx == 0 else "e"
-            
+
             hdr_l = tk.Label(f, text=lbl_text, font=F8, bg=BG_P, fg=TD)
             hdr_l.pack(anchor=align)
-            l = tk.Label(f, text="0 ISK", font=tkfont.Font(family="Consolas", size=11, weight="bold"), bg=BG_P, fg=c)
+            self._brk_r3_hdrs.append(hdr_l)
+            l = tk.Label(f, text="0 ISK", font=FVAL, bg=BG_P, fg=c)
             l.pack(anchor=align)
-            
+
             if lbl_text == "LOOT ESTIMATE (CTRL+C)":
                 self.ll = l
+                DynamicTooltip(l, lambda: self._brk_exact.get("loot", "—"))
+                # Conservé en attribut : _update_breakdown_labels y écrit
+                # « (LOCKED) » en rouge quand le presse-papiers est verrouillé.
+                # L'avertissement va sur l'EN-TÊTE et non sur la valeur, pour
+                # deux raisons : on verrouille justement parce qu'on manipule du
+                # butin, donc masquer le total courant serait contre-productif ;
+                # et _loot_label_restore_fg() repeint la valeur en CI après
+                # chaque estimation, ce qui écraserait un rouge posé là.
+                self._loot_hdr_lbl = hdr_l
                 Tooltip(hdr_l, "Copy items from inventory (CTRL+C) to parse value")
+
+                # UNDO : retire le dernier import. Éteint tant que la pile est
+                # vide, pour qu'il ne promette pas une action indisponible.
+                self._loot_undo_btn = tk.Label(
+                    f, text="UNDO",
+                    font=tkfont.Font(family="Consolas", size=7, weight="bold"),
+                    bg=BG_P, fg=TD, padx=3)
+                self._loot_undo_btn.pack(anchor=align)
+                self._loot_undo_btn.bind("<Button-1>", lambda e: self._undo_last_loot())
+                self._loot_undo_btn.bind("<Enter>", lambda e: self._loot_undo_btn.config(
+                    bg=BDG if self._loot_stack else BG_P))
+                self._loot_undo_btn.bind("<Leave>", lambda e: self._loot_undo_btn.config(bg=BG_P))
+                DynamicTooltip(self._loot_undo_btn,
+                               lambda: (f"Remove last loot import ({fisk(self._loot_stack[-1][0])})"
+                                        if self._loot_stack else "No loot import to undo"))
+                self._refresh_undo_btn()
             else:
                 self.tnl = l
+                DynamicTooltip(l, lambda: self._brk_exact.get("total_net", "—"))
+
+    # Ajuste une rangée du breakdown à la place RÉELLEMENT disponible.
+    #
+    # Le breakdown affiche des montants exacts (fiskf) : c'est là que le joueur
+    # vient chercher le chiffre au dernier ISK, et l'abréger par défaut viderait
+    # la section de son intérêt. Mais trois nombres à neuf chiffres ne tiennent
+    # pas dans 290 px, et pack(expand=True, fill="x") ne rétrécit pas les
+    # colonnes trop larges — il sert les premières et rogne la dernière, qui
+    # disparaît du bord droit (KILLS réduit à un fragment de glyphe).
+    #
+    # On mesure donc la rangée avant d'écrire : tant que la forme longue tient,
+    # on la garde ; sinon TOUTE la rangée bascule sur fisk(), car mélanger
+    # « 100 000 000 » et « -12.50M » côte à côte serait illisible. Le montant
+    # exact reste accessible en infobulle sur chaque valeur.
+    #
+    # Mesurer la largeur courante plutôt que de coder un seuil de magnitude fait
+    # que le panneau ISK détaché — et la fenêtre principale, redimensionnable
+    # elle aussi — gardent les montants exacts tant qu'ils sont assez larges.
+    #
+    # Marge interne d'un tk.Label (padx par défaut + bordure) : mesurée à 6 px,
+    # constante pour tous les labels du breakdown. Sans elle on sous-estime
+    # chaque colonne et la rangée déborde encore d'un cheveu.
+    _BRK_LBL_PAD = 6
+
+    def _brk_fit_row(self, row, hdrs, cells):
+        # cells : [(forme_longue, forme_courte), ...] alignées sur hdrs.
+        # Renvoie la liste des chaînes à afficher.
+        long_forms = [c[0] for c in cells]
+        hf, vf = self._brk_hdr_font, self._brk_val_font
+        if row is None or hf is None or vf is None or len(hdrs) != len(cells):
+            return long_forms
+        try:
+            avail = row.winfo_width()
+            # Avant le premier affichage Tk renvoie 1 : on ne sait rien encore,
+            # donc on garde l'exact — le tick suivant tranchera pour de bon.
+            if avail <= 1:
+                return long_forms
+            # Largeur naturelle d'une colonne = la plus large de ses deux lignes.
+            need = sum(max(hf.measure(h.cget("text")), vf.measure(lng)) + self._BRK_LBL_PAD
+                       for h, lng in zip(hdrs, long_forms))
+        except Exception:
+            _log_exc("CharacterWindow._brk_fit_row")
+            return long_forms
+        return long_forms if need <= avail else [c[1] for c in cells]
 
     # Bascule l'affichage du sous-panneau breakdown ISK
     def _toggle_breakdown(self):
@@ -2601,7 +3306,8 @@ class CharacterWindow:
             self._brk_tog_btn.config(text="\u25BC")
             self._brk_wrap.pack(fill="x", padx=6, pady=(2, 2))
 
-        # Resize: main window or detached ISK window
+        # Redimensionnement, qu'il vienne de la fenêtre principale ou du panneau ISK
+        # détaché : les deux passent par ici.
         if self._isk_detached and self._isk_window:
             try:
                 w = self._isk_window.w
@@ -2613,11 +3319,14 @@ class CharacterWindow:
                 req_h = body.winfo_reqheight() + 49
                 w.geometry(f"{cur_w}x{req_h}+{w.winfo_x()}+{w.winfo_y()}")
             except Exception:
-                pass
+                _log_exc("CharacterWindow._toggle_breakdown:2584")
         else:
             self._fit()
 
-    # Construit la section Mission Tracker
+    # Suivi de mission. Son intérêt principal est le compteur de storyline :
+    # EVE en propose une tous les 16 rendus et n'indique nulle part où l'on en
+    # est. Le nom de la mission, lui, reste vide — le client ne l'écrit dans
+    # aucun log, donc aucun lecteur de log ne peut le connaître.
     def _build_missions(self, parent, detached=False):
         F8  = tkfont.Font(family="Consolas", size=8)
         F7B = tkfont.Font(family="Consolas", size=7, weight="bold")
@@ -2628,7 +3337,8 @@ class CharacterWindow:
         self._msn_pad = dict(padx=6, pady=(2, 4))
 
         # ── Header: [accent] [MISSION TRACKER] [ON/OFF] ... [▼/▶] [↱] ──
-        # Skip header when detached — DetachedWindow provides its own
+        # Pas d'en-tête en version détachée : DetachedWindow fournit déjà le sien,
+        # et deux barres de titre superposées seraient absurdes.
         if not detached:
             hdr_f = tk.Frame(parent, bg=BG_P, height=20)
             hdr_f.pack(fill="x")
@@ -2704,7 +3414,9 @@ class CharacterWindow:
             self._msn_det_labels = {"msn_name": self._msn_name_lbl, "msn_obj": self._msn_obj_lbl,
                                      "msn_story": self._msn_story_lbl, "msn_done": self._msn_done_lbl}
 
-    # Construit la section Anomaly Tracker
+    # Suivi d'anomalies : découpe la session en sites successifs pour répondre
+    # à « ce site vaut-il le temps qu'il prend ? ». EVE ne signale ni le début
+    # ni la fin d'un site, d'où la déduction par silence de combat (ANOM_GAP).
     def _build_anomalies(self, parent, detached=False):
         F8   = tkfont.Font(family="Consolas", size=8)
         F7B  = tkfont.Font(family="Consolas", size=7, weight="bold")
@@ -2714,7 +3426,8 @@ class CharacterWindow:
         self._anom_pad = dict(padx=6, pady=(2, 4))
 
         # ── Header: [accent] [ANOMALY TRACKER] [ON/OFF] ... [▼/▶] [↱] ──
-        # Skip header when detached — DetachedWindow provides its own
+        # Pas d'en-tête en version détachée : DetachedWindow fournit déjà le sien,
+        # et deux barres de titre superposées seraient absurdes.
         if not detached:
             hdr_f = tk.Frame(parent, bg=BG_P, height=20)
             hdr_f.pack(fill="x")
@@ -2786,10 +3499,43 @@ class CharacterWindow:
             l.pack(anchor="w")
             setattr(self, attr, l)
 
+        # \u2500\u2500 Butin de la passe \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
+        # La ligne du dessus ne compte QUE les bounties : anom_current["isk"]
+        # n'est aliment\u00e9 que par _anom_add_bounty, et EVE n'\u00e9crit rien sur le
+        # butin dans ses logs. Un MTU pos\u00e9 sur quatre havens puis ramass\u00e9 d'un
+        # coup arrive donc comme UNE cargaison pour tout le groupe, et n'appara\u00eet
+        # nulle part dans les stats par site.
+        # Le groupe de sites, c'est la session : la valeur ici est le total de
+        # session, et l'ISK par site le divise par les sites parcourus.
+        tk.Frame(aw, bg=BD, height=1).pack(fill="x", pady=3)
+
+        r3 = tk.Frame(aw, bg=BG_P)
+        r3.pack(fill="x")
+        for lbl_text, c, attr, tip in [
+            ("RUN LOOT", CI, "_anom_run_loot_lbl",
+             "Loot valued this session - one MTU pickup covers every site since the last reset"),
+            ("ISK / SITE (+LOOT)", CG, "_anom_isk_site_lbl",
+             "Session net including loot, split across the sites run.\n"
+             "For MTU runs, do NOT press NEXT SITE until you have salvaged -\n"
+             "it saves and resets the session, so the loot lands on one site."),
+        ]:
+            f = tk.Frame(r3, bg=BG_P)
+            f.pack(side="left", expand=True, fill="x")
+            hdr_l = tk.Label(f, text=lbl_text, font=F8, bg=BG_P, fg=TD)
+            hdr_l.pack(anchor="w")
+            l = tk.Label(f, text="\u2014", font=F9B, bg=BG_P, fg=c)
+            l.pack(anchor="w")
+            setattr(self, attr, l)
+            # Le pi\u00e8ge du NEXT SITE n'est devinable par personne : il se dit ici.
+            Tooltip(hdr_l, tip)
+            Tooltip(l, tip)
+
         if detached:
             self._anom_det_labels = {"cur": self._anom_cur_lbl, "cleared": self._anom_cleared_lbl,
                                       "avg_time": self._anom_avg_time_lbl, "avg_isk": self._anom_avg_isk_lbl,
-                                      "best_isk": self._anom_best_isk_lbl}
+                                      "best_isk": self._anom_best_isk_lbl,
+                                      "run_loot": self._anom_run_loot_lbl,
+                                      "isk_site": self._anom_isk_site_lbl}
             self._anom_wrap.bind("<Configure>", self._on_anom_detached_resize)
 
     # Adapte la police de la section anomalie quand la fenêtre détachée est redimensionnée
@@ -2814,7 +3560,8 @@ class CharacterWindow:
             else:
                 val_font.configure(size=val_size)
             labels = self._anom_det_labels
-            for key in ("cur", "cleared", "avg_time", "avg_isk", "best_isk"):
+            for key in ("cur", "cleared", "avg_time", "avg_isk", "best_isk",
+                        "run_loot", "isk_site"):
                 if labels.get(key):
                     labels[key].config(font=val_font)
         finally:
@@ -2827,7 +3574,9 @@ class CharacterWindow:
         if getattr(self, '_scaling_isk', False):
             return
             
-        # Scaling by width prevents text from shrinking wildly when the breakdown is collapsed
+        # Mise à l'échelle sur la LARGEUR et non la hauteur : replier le détail
+        # réduit brutalement la hauteur, et le texte rapetisserait sans raison alors
+        # que la fenêtre est toujours aussi large.
         w = event.width
         last_w = getattr(self, '_isk_det_last_w', 0)
         if abs(w - last_w) < 5:
@@ -2836,7 +3585,8 @@ class CharacterWindow:
 
         self._scaling_isk = True
         try:
-            # Base width of ~350 yields scale ~1.0. Keeps text sizes reasonable.
+            # Une largeur de référence d'environ 350 px donne un facteur proche de 1,
+            # ce qui garde des tailles de texte raisonnables par défaut.
             scale     = max(0.8, min(2.5, w / 350))
             val_size  = max(11, min(32, int(14 * scale)))
             sess_size = max(11, min(24, int(12 * scale)))
@@ -2854,24 +3604,29 @@ class CharacterWindow:
         finally:
             self._scaling_isk = False
 
-    # ── Graphique d'historique DPS ────────────────────────────────────
+    # ── Historique DPS pour le graphique ─────────────────────────────────
 
-    # Ajoute les valeurs DPS courantes au deque d'historique (appelé à chaque tick)
+    # Échantillonnage à chaque tick plutôt qu'à chaque événement de combat : le
+    # graphique a besoin d'un pas de temps RÉGULIER, sinon une rafale de coups
+    # tasserait les points et une accalmie les étirerait, rendant la courbe
+    # illisible. Les creux entre deux salves font partie de l'information.
     def _sample_dps_history(self, dps_out=None, dps_in=None):
-        # _tick already computed both values this frame — accept them to avoid
-        # two redundant dps() recomputations per tick.
+        # _tick a déjà calculé les deux valeurs pour ce tour : on les accepte en
+        # paramètre plutôt que de rappeler dps() deux fois inutilement.
         d = self.data
         if dps_out is None: dps_out = d.dps(True)
         if dps_in is None:  dps_in  = d.dps(False)
         d.dps_hist.append((time.monotonic(), dps_out, dps_in))
 
-    # ── Section toggle helpers ───────────────────────────────────────
-    # Active/désactive une section (avec exclusivité mutuelle MSN/ANOM)
+    # ── Activation et repli des sections ─────────────────────────────────
+    # Chaque joueur ne suit qu'une partie des métriques : un ratteur d'anomalies
+    # n'a que faire du suivi de mission, et inversement. Désactiver une section
+    # la retire de la fenêtre, qui rétrécit d'autant.
     def _toggle_enabled(self, section):
         attr = f"_{section}_enabled"
         enabled = not getattr(self, attr)
 
-        # ── Mutual exclusivity: MSN and ANOM cannot both be ON ──
+        # ── Exclusion mutuelle : missions et anomalies jamais ensemble ──
         if enabled and section in ("msn", "anom"):
             other = "anom" if section == "msn" else "msn"
             if getattr(self, f"_{other}_enabled"):
@@ -2881,7 +3636,8 @@ class CharacterWindow:
         self.char_cfg[f"{section}_enabled"] = enabled
         save_config(self.cfg)
 
-        # If turning OFF while detached, reattach first
+        # Désactiver une section détachée doit d'abord la rattacher : sinon sa
+        # fenêtre flottante resterait orpheline à l'écran.
         if not enabled:
             self._force_detach_off(section)
 
@@ -2890,7 +3646,8 @@ class CharacterWindow:
         if on_btn:
             on_btn.config(text="ON" if enabled else "OFF", fg=CA if enabled else CS)
 
-        # Show/hide header controls and content
+        # Les contrôles d'en-tête suivent l'état : une section éteinte ne doit pas
+        # laisser des boutons qui ne pilotent plus rien.
         if not getattr(self, f"_{section}_detached", False):
             tog = getattr(self, f"_{section}_tog_btn", None)
             det = getattr(self, f"_{section}_det_btn", None)
@@ -2914,10 +3671,11 @@ class CharacterWindow:
 
         self._fit()
 
-    # Désactive de force une section (exclusivité mutuelle MSN/ANOM)
+    # Missions et anomalies décrivent la même chose — l'activité en cours — et
+    # se disputeraient la même place : activer l'une éteint donc l'autre.
     def _force_disable(self, section):
 
-        # Force-disable a section (for mutual exclusivity)
+        # Extinction forcée, imposée par l'exclusion mutuelle.
         setattr(self, f"_{section}_enabled", False)
         self.char_cfg[f"{section}_enabled"] = False
 
@@ -2940,10 +3698,12 @@ class CharacterWindow:
 
         save_config(self.cfg)
 
-    # Réattache et ferme la fenêtre détachée d'une section
+    # Désactiver une section détachée doit aussi fermer sa fenêtre flottante,
+    # sinon elle resterait orpheline à l'écran, sans plus rien pour la piloter.
     def _force_detach_off(self, section):
 
-        # Reattach and close detached window if section is detached
+        # Rattache PUIS ferme la fenêtre flottante : fermer d'abord perdrait la
+        # position enregistrée du panneau.
         detached_attr = f"_{section}_detached"
         if getattr(self, detached_attr, False):
             window_attr = f"_{section}_window"
@@ -2953,7 +3713,7 @@ class CharacterWindow:
                     win._save_geometry()
                     win.w.destroy()
                 except Exception:
-                    pass
+                    _log_exc("CharacterWindow._force_detach_off:2924")
                 setattr(self, window_attr, None)
             setattr(self, detached_attr, False)
             det_labels_attr = f"_{section}_det_labels"
@@ -2965,16 +3725,22 @@ class CharacterWindow:
             build_fn(container, detached=False)
             container.grid()
 
-    # Retourne le nom de la méthode de construction pour une section
+    # Résolution par NOM de la fonction de construction : détacher, rattacher
+    # et activer une section doivent tous rebâtir le même contenu, et passer par
+    # une table évite d'avoir trois chaînes de if à garder synchronisées.
     def _section_build_name(self, section):
         names = {"isk": "isk", "msn": "missions", "anom": "anomalies"}
         return names.get(section, section)
 
-    # Retourne le padding approprié pour une section
+    # Les marges diffèrent d'une section à l'autre : détachée ou intégrée, une
+    # section n'a pas les mêmes voisines, et un espacement uniforme laissait des
+    # trous visibles entre les panneaux.
     def _get_section_pad(self, section):
         return dict(padx=6, pady=(2, 4))
 
-    # Collapse/déplie une section de l'interface
+    # Replier une section garde son en-tête (donc son état d'un coup d'œil) tout
+    # en rendant la place à l'écran. Distinct de la désactivation : replié, le
+    # suivi continue ; désactivé, il s'arrête.
     def _toggle_collapse(self, section):
         attr = f"_{section}_collapsed"
         collapsed = not getattr(self, attr)
@@ -3000,7 +3766,9 @@ class CharacterWindow:
                     wrap.pack(fill="x", **self._get_section_pad(section))
         self._fit()
 
-    # Crée un en-tête de section coloré générique
+    # Fabrique d'en-têtes commune aux quatre sections : la couleur d'accent est
+    # le seul repère qui permette de les distinguer du coin de l'œil, donc elles
+    # doivent partager exactement la même structure.
     def _sec(self, par, title, accent):
         tb = tk.Frame(par, bg=BG_P, height=20)
         tb.pack(fill="x")
@@ -3008,7 +3776,8 @@ class CharacterWindow:
         tk.Frame(tb, bg=accent, width=3).pack(side="left", fill="y")
         tk.Label(tb, text=f"  {title}", font=tkfont.Font(family="Consolas", size=8, weight="bold"), bg=BG_P, fg=accent).pack(side="left")
 
-    # Met à jour les couleurs des boutons Play/Pause/Stop selon l'état
+    # Seule la COULEUR change, jamais la disposition : les boutons gardent leur
+    # place quel que soit l'état, pour qu'on puisse cliquer sans regarder.
     def _update_buttons(self):
         for bs in self._btn_sets:
             go = bs["go"]
@@ -3027,7 +3796,9 @@ class CharacterWindow:
                 pa.config(fg=TD)
                 st.config(fg=TD)
 
-    # Met à jour les labels ISK/heure et timer (live ou frozen)
+    # Le paramètre `frozen` sert l'état Stop : l'affichage doit rester figé sur
+    # les totaux de fin de session, alors que les données continuent d'exister.
+    # On passe un instantané plutôt que de geler l'objet Data lui-même.
     def _update_isk_labels(self, labels, frozen=None):
         if not labels: return
         il = labels.get("il")
@@ -3035,69 +3806,147 @@ class CharacterWindow:
         if frozen:
             if il:
                 font = self._isk_font_big if frozen["isk_font"] == "big" else self._isk_font_calc
-                il.config(text=frozen["isk_text"], fg=frozen["isk_fg"], font=font)
+                self._cset(il, text=frozen["isk_text"], fg=frozen["isk_fg"], font=font)
             if sl:
-                sl.config(text=frozen["timer"])
+                self._cset(sl, text=frozen["timer"])
         else:
             d = self.data
             if il:
                 if self._st == "running":
                     if d.secs() >= 60 and d.bg > 0:
-                        il.config(text=f"{fisk(d.isk())} ISK", fg=CI, font=self._isk_font_big)
+                        self._cset(il, text=f"{fisk(d.isk())} ISK", fg=CI, font=self._isk_font_big)
                     else:
-                        # Still waiting for data — show CALC animation
+                        # Pas encore assez de données : l'animation CALC vaut mieux qu'un zéro,
+                        # qui se lirait comme un vrai résultat.
                         self._show_calc_on(il)
                 elif self._st == "paused":
                     if d.secs() >= 60 and d.bg > 0:
-                        il.config(text=f"{fisk(d.isk())} ISK", fg=CP, font=self._isk_font_big)
+                        self._cset(il, text=f"{fisk(d.isk())} ISK", fg=CP, font=self._isk_font_big)
                     else:
-                        il.config(text="\u2014 PAUSED \u2014", fg=CP, font=self._isk_font_calc)
+                        self._cset(il, text="\u2014 PAUSED \u2014", fg=CP, font=self._isk_font_calc)
                 elif self._st == "stopped":
-                    il.config(text="\u2014 STANDBY \u2014", fg=TD, font=self._isk_font_calc)
+                    self._cset(il, text="\u2014 STANDBY \u2014", fg=TD, font=self._isk_font_calc)
             if sl:
                 dur = fdur(d.secs()) if (d.t0 or d.acc_sec > 0) else "00:00"
-                sl.config(text=dur)
+                self._cset(sl, text=dur)
 
     # Met à jour les labels du breakdown (bounties, taxes, kills, loot)
+    # Configure un label uniquement si une valeur a réellement changé.
+    def _cset(self, lbl, **kw):
+        """Dirty-flag wrapper around Label.config().
+
+        The per-tick updaters below used to call .config() unconditionally —
+        measured at 14 calls per tick per character, 100 % of them rewriting the
+        value already on screen. Same idea as MainUI._lset, but the cache lives
+        ON THE WIDGET rather than in an id()-keyed dict: detached panels destroy
+        and rebuild their labels, and CPython reuses id() after GC, so an
+        id-keyed cache can go stale and silently freeze a label.
+        """
+        if lbl is None:
+            return
+        prev = getattr(lbl, "_last_cfg", None)
+        if prev is None:
+            prev = {}
+            try:
+                lbl._last_cfg = prev
+            except Exception:
+                prev = None
+        if prev is None:                      # can't cache — just write through
+            try: lbl.config(**kw)
+            except Exception: _log_exc("CharacterWindow._cset:3053")
+            return
+        delta = {k: v for k, v in kw.items() if prev.get(k, _UNSET) != v}
+        if not delta:
+            return
+        prev.update(delta)
+        try:
+            lbl.config(**delta)
+        except Exception:
+            _log_exc("CharacterWindow._cset:3061")
+
     def _update_breakdown_labels(self, frozen=None):
+        # Les deux sources fournissent les mêmes GRANDEURS BRUTES, et le
+        # formatage se fait ici, en un seul endroit : c'est lui qui décide entre
+        # forme longue et courte selon la largeur (voir _brk_fit_row), et le
+        # figé doit prendre exactement la même décision que le direct.
         if frozen:
-            self.gl.config(text=frozen["gross"])
-            self.tl.config(text=frozen["taxes"])
-            self.bl.config(text=frozen["kills"])
-            self.ll.config(text=frozen["loot"])
-            self.tnl.config(text=frozen["total_net"])
+            gross = frozen.get("gross_v", 0.0)
+            taxes = frozen.get("taxes_v", 0.0)
+            kills = frozen.get("kills", "0")
+            loot  = frozen.get("loot_v", 0.0)
+            net   = frozen.get("net_v", 0.0)
         else:
             d = self.data
-            self.gl.config(text=f"{fiskf(d.bg)} ISK")
-            self.tl.config(text=f"-{fiskf(d.bg*d.tax)} ISK")
-            self.bl.config(text=str(d.bc))
-            if not self._loot_loading:   # don't overwrite the spinner
-                self.ll.config(text=f"{fiskf(d.loot_val)} ISK")
-            self.tnl.config(text=f"{fiskf(d.bg*(1-d.tax) + d.loot_val)} ISK")
+            gross = d.bg
+            taxes = d.bg * d.tax
+            kills = str(d.bc)
+            loot  = d.loot_val
+            net   = d.bg * (1 - d.tax) + d.loot_val
+
+        # Montants exacts servis par les infobulles, qu'on affiche la forme
+        # longue ou la courte : c'est le filet de sécurité qui autorise
+        # l'abréviation sans jamais rendre le chiffre exact inaccessible.
+        self._brk_exact = {
+            "gross":     f"{fiskf(gross)} ISK",
+            "taxes":     f"-{fiskf(taxes)} ISK",
+            "loot":      f"{fiskf(loot)} ISK",
+            "total_net": f"{fiskf(net)} ISK",
+        }
+
+        g_txt, t_txt, k_txt = self._brk_fit_row(
+            self._brk_r1, self._brk_r1_hdrs,
+            [(f"{fiskf(gross)} ISK", f"{fisk(gross)} ISK"),
+             (f"-{fiskf(taxes)} ISK", f"-{fisk(taxes)} ISK"),
+             (kills, kills)])
+        self._cset(self.gl, text=g_txt)
+        self._cset(self.tl, text=t_txt)
+        self._cset(self.bl, text=k_txt)
+
+        l_txt, n_txt = self._brk_fit_row(
+            self._brk_r3, self._brk_r3_hdrs,
+            [(f"{fiskf(loot)} ISK", f"{fisk(loot)} ISK"),
+             (f"{fiskf(net)} ISK",  f"{fisk(net)} ISK")])
+        if not self._loot_loading:   # don't overwrite the spinner
+            self._cset(self.ll, text=l_txt)
+        self._cset(self.tnl, text=n_txt)
+
+        # Avertissement de verrou, dans les deux branches : l'état figé du Stop
+        # n'a rien à voir avec le verrou, qui reste actif fenêtre arrêtée ou non.
+        # _cset ne réécrit que si la valeur change, donc pas de coût par tick.
+        if self._loot_hdr_lbl:
+            if _CLIP_LOCK:
+                self._cset(self._loot_hdr_lbl, text="LOOT ESTIMATE (LOCKED)", fg=CS)
+            else:
+                self._cset(self._loot_hdr_lbl, text="LOOT ESTIMATE (CTRL+C)", fg=TD)
 
     # Met à jour les labels de mission (nom, objectif, compteurs)
     def _update_mission_labels(self, frozen=None):
         if frozen:
             name = frozen.get("msn_name", "\u2014 None \u2014")
-            self._msn_name_lbl.config(text=name[:24], fg=C_MSN if name != "\u2014 None \u2014" else CM)
+            self._cset(self._msn_name_lbl, text=name[:24],
+                       fg=C_MSN if name != "\u2014 None \u2014" else CM)
             obj = frozen.get("msn_obj", "\u2014")
-            self._msn_obj_lbl.config(text=obj, fg=CA if "\u2714" in obj else CM)
-            self._msn_done_lbl.config(text=frozen.get("msn_done", "0"))
-            self._msn_story_lbl.config(text=frozen.get("msn_story", "0/16"))
+            self._cset(self._msn_obj_lbl, text=obj, fg=CA if "\u2714" in obj else CM)
+            self._cset(self._msn_done_lbl,  text=frozen.get("msn_done", "0"))
+            self._cset(self._msn_story_lbl, text=frozen.get("msn_story", "0/16"))
         else:
             d = self.data
             name = d.mission_name or "\u2014 None \u2014"
-            self._msn_name_lbl.config(text=name[:24], fg=C_MSN if d.mission_name else CM)
+            self._cset(self._msn_name_lbl, text=name[:24],
+                       fg=C_MSN if d.mission_name else CM)
             if d.mission_obj_met:
-                self._msn_obj_lbl.config(text="\u2714 DONE", fg=CA)
+                self._cset(self._msn_obj_lbl, text="\u2714 DONE", fg=CA)
             elif d.mission_name:
-                self._msn_obj_lbl.config(text="IN PROGRESS", fg=CP)
+                self._cset(self._msn_obj_lbl, text="IN PROGRESS", fg=CP)
             else:
-                self._msn_obj_lbl.config(text="\u2014", fg=CM)
-            self._msn_done_lbl.config(text=str(d.missions_done))
-            self._msn_story_lbl.config(text=f"{self._storyline_ctr}/16")
+                self._cset(self._msn_obj_lbl, text="\u2014", fg=CM)
+            self._cset(self._msn_done_lbl,  text=str(d.missions_done))
+            self._cset(self._msn_story_lbl, text=f"{self._storyline_ctr}/16")
 
-    # Redessine le feed d'alertes si le contenu a changé
+    # Le fil d'alertes est la seule zone RECONSTRUITE plutôt que mise à jour :
+    # son contenu est une liste de longueur variable, pas un ensemble fixe de
+    # labels. D'où la comparaison préalable — reconstruire à chaque tick ferait
+    # clignoter la section en permanence.
     def _update_alert_labels(self, frozen=None):
         if frozen:
             alerts = frozen.get("msn_alerts", [])
@@ -3108,7 +3957,8 @@ class CharacterWindow:
         if not hasattr(self, '_last_alert_key') or self._last_alert_key != alert_key:
             self._last_alert_key = alert_key
             
-            # Use dynamic font size if detached, otherwise default 9pt
+            # Détaché, le panneau peut être agrandi : la police suit. Intégré, elle
+            # reste fixe, la fenêtre s'ajustant déjà à son contenu.
             font_size = getattr(self, '_alert_det_font_size', 9) if self._alert_detached else 9
             F_alert = self._alert_font_cache.get(font_size)
             if F_alert is None:
@@ -3149,32 +3999,42 @@ class CharacterWindow:
             avg_isk  = frozen.get("anom_avg_isk", "\u2014")
             best_isk = frozen.get("anom_best_isk", "\u2014")
             cur_time = frozen.get("anom_cur_time", "\u2014")
-            self._anom_cur_lbl.config(text=cur_time if cur_time != "\u2014" else "\u2014 Stopped \u2014", fg=C_ANOM if cur_time != "\u2014" else CM)
-            self._anom_cleared_lbl.config(text=str(sites))
-            self._anom_avg_time_lbl.config(text=avg_time)
-            self._anom_avg_isk_lbl.config(text=avg_isk)
-            self._anom_best_isk_lbl.config(text=best_isk)
+            self._cset(self._anom_cur_lbl,
+                       text=cur_time if cur_time != "\u2014" else "\u2014 Stopped \u2014",
+                       fg=C_ANOM if cur_time != "\u2014" else CM)
+            self._cset(self._anom_cleared_lbl,  text=str(sites))
+            self._cset(self._anom_avg_time_lbl, text=avg_time)
+            self._cset(self._anom_avg_isk_lbl,  text=avg_isk)
+            self._cset(self._anom_best_isk_lbl, text=best_isk)
+            self._cset(self._anom_run_loot_lbl, text=frozen.get("anom_run_loot", "—"))
+            self._cset(self._anom_isk_site_lbl, text=frozen.get("anom_isk_site", "—"))
         else:
             d = self.data
-            n, avg_time, avg_isk, best_isk, cur_secs = self._anom_stats()
+            n, avg_time, avg_isk, best_isk, cur_secs, run_loot, isk_site = self._anom_stats()
 
-            # When paused, show frozen anomaly time instead of live
+            # En pause, on fige le chrono du site : le laisser courir pendant un trajet
+            # fausserait la durée moyenne par anomalie.
             if self._st == "paused" and self._anom_paused_secs > 0:
                 cur_secs = self._anom_paused_secs
             if d.anom_current and cur_secs > 0:
-                self._anom_cur_lbl.config(text=fdur(cur_secs), fg=CP if self._st == "paused" else C_ANOM)
+                self._cset(self._anom_cur_lbl, text=fdur(cur_secs),
+                           fg=CP if self._st == "paused" else C_ANOM)
             elif self._st == "running":
-                self._anom_cur_lbl.config(text="\u2014 Warping \u2014", fg=CM)
+                self._cset(self._anom_cur_lbl, text="\u2014 Warping \u2014", fg=CM)
             elif self._st == "paused":
-                self._anom_cur_lbl.config(text="\u2014 Paused \u2014", fg=CP)
+                self._cset(self._anom_cur_lbl, text="\u2014 Paused \u2014", fg=CP)
             else:
-                self._anom_cur_lbl.config(text="\u2014 Idle \u2014", fg=CM)
-            self._anom_cleared_lbl.config(text=str(n))
-            self._anom_avg_time_lbl.config(text=fdur(avg_time) if avg_time > 0 else "\u2014")
-            self._anom_avg_isk_lbl.config(text=fisk(avg_isk) if avg_isk > 0 else "\u2014")
-            self._anom_best_isk_lbl.config(text=fisk(best_isk) if best_isk > 0 else "\u2014")
+                self._cset(self._anom_cur_lbl, text="\u2014 Idle \u2014", fg=CM)
+            self._cset(self._anom_cleared_lbl,  text=str(n))
+            self._cset(self._anom_avg_time_lbl, text=fdur(avg_time) if avg_time > 0 else "\u2014")
+            self._cset(self._anom_avg_isk_lbl,  text=fisk(avg_isk) if avg_isk > 0 else "\u2014")
+            self._cset(self._anom_best_isk_lbl, text=fisk(best_isk) if best_isk > 0 else "\u2014")
+            self._cset(self._anom_run_loot_lbl, text=fisk(run_loot) if run_loot > 0 else "\u2014")
+            self._cset(self._anom_isk_site_lbl, text=fisk(isk_site) if isk_site > 0 else "\u2014")
 
-    # Lance l'animation CALC sur le label ISK principal
+    # Pendant la première minute, l'ISK/heure n'a pas de sens (voir Data.isk) :
+    # plutôt qu'un zéro trompeur, on affiche une animation qui dit clairement
+    # « en cours de calcul ».
     def _show_calc(self): self._show_calc_on(self.il)
 
     # Affiche l'animation CALC sur un label donné
@@ -3183,24 +4043,28 @@ class CharacterWindow:
         dots = "." * self._calc_dots
         pad  = " " * (3 - self._calc_dots)
         if self._st != "running" or (self.data.t0 is None and self.data.acc_sec == 0):
-            label.config(text="\u2014 STANDBY \u2014", fg=TD)
+            self._cset(label, text="\u2014 STANDBY \u2014", fg=TD)
         else:
-            label.config(text=f"\u25C8 CALC{dots}{pad}", fg=CK)
+            self._cset(label, text=f"\u25C8 CALC{dots}{pad}", fg=CK)
 
-    # Sauvegarde la session, la config et ferme l'application
+    # Fermeture d'une fenêtre de personnage. L'ordre compte : archiver la
+    # session AVANT de détruire les widgets (le taux de taxe se lit dans un
+    # champ), puis annuler les boucles after() — sinon elles se déclencheraient
+    # sur des widgets détruits.
     def _quit(self):
         d = self.data
 
         # Always save session on close if there's any data worth saving
         if not self._session_saved and (d.bg > 0 or d.dd > 0 or d.loot_val > 0):
 
-            # Accumulate running time if still active
+            # Le segment en cours est versé dans le temps accumulé : sans ça, arrêter une
+            # session en perdrait la dernière portion.
             if d.t0:
                 d.acc_sec += (datetime.now(timezone.utc) - d.t0).total_seconds()
                 d.t0 = None
             try: d.tax = max(0, min(float(self.tax_var.get()) / 100, 1))
             except Exception:
-                pass
+                _log_exc("CharacterWindow._quit:3209")
             self._anom_close_current()
             char_name = self.char_name
             try: tax_pct = float(self.tax_var.get())
@@ -3222,7 +4086,7 @@ class CharacterWindow:
                     win._save_geometry()
                     win.w.destroy()
             except Exception:
-                pass
+                _log_exc("CharacterWindow._quit:3231")
         save_config(self.cfg)
         if self.fh:
             self.fh.close()
@@ -3231,12 +4095,15 @@ class CharacterWindow:
             jid = getattr(self, _job, None)
             if jid:
                 try: self.root.after_cancel(jid)
-                except Exception: pass
+                except Exception: _log_exc("CharacterWindow._quit:3241")
                 setattr(self, _job, None)
         self.root.destroy()   # destroys this Toplevel; MainUI root stays alive
 
-    # ── Parse a combat log line ──────────────────────────────────────
-    # Parse une ligne de log de combat et met à jour les données de session
+    # ── Analyse d'une ligne de gamelog ───────────────────────────────────
+    # Cœur de l'application : chaque ligne du gamelog passe ici. Appelée
+    # potentiellement des centaines de fois par seconde en plein combat, d'où
+    # l'ordre des tests — les événements les plus fréquents d'abord, et un
+    # filtre par mots-clés en amont pour écarter d'emblée les lignes inutiles.
     def _parse(self, raw):
         d = self.data
         ts = datetime.now(timezone.utc)
@@ -3245,15 +4112,19 @@ class CharacterWindow:
             try:
                 ts = datetime.strptime(m.group(1), "%Y.%m.%d %H:%M:%S").replace(tzinfo=timezone.utc)
             except Exception:
-                pass
+                _log_exc("CharacterWindow._parse:3254")
 
         if RE_SS.search(raw) or raw.strip().startswith("---"): return
 
-        # Fast skip — only process lines with known keywords
+        # Filtre rapide : en plein combat le gamelog dépasse la centaine de lignes
+        # par seconde et la plupart ne nous concernent pas. Un test d'appartenance
+        # sur quelques mots-clés coûte bien moins cher que de lancer une douzaine
+        # de regex sur chaque ligne.
         if not any(k in raw for k in ('(combat)', '(bounty)', '(notify)', 'Objective', 'mission', 'standings', 'Dreadnought')):
             return
 
-        # Most common events first
+        # Les événements les plus fréquents en premier : chaque test évité l'est pour
+        # des centaines de lignes par seconde.
         if (m := RE_TO.search(raw)):
             dm = int(m.group(1) or m.group(4))   # group 1=HTML alt, 4=plain alt
             d.add_dmg_out(ts, dm)
@@ -3328,7 +4199,8 @@ class CharacterWindow:
             d.alerts.append((now_str, "ESCAL", f"\u272A ESCALATION: {m.group(1).strip()}"))
             return
 
-        # EWAR — scramble fires as (combat) line; group 1=HTML alt, 2=plain alt
+        # EWAR — le scram arrive en ligne (combat). Groupe 1 = variante HTML,
+        # groupe 2 = variante texte brut.
         m = RE_SCRAM.search(raw)
         if m:
             npc = shtml((m.group(1) or m.group(2)).strip())
@@ -3336,10 +4208,11 @@ class CharacterWindow:
             self._flash_alert()
             return
 
-        # EWAR \u2014 web fires as a (notify) line in this same gamelog. It used to be
-        # matched only against chatlog lines, which never carry a "(notify)" tag,
-        # so WEB alerts could never fire. ('(notify)' is already in the fast-skip
-        # keyword list above, so these lines reach this point.)
+        # EWAR — le web arrive en ligne (notify) dans ce même gamelog. Il était
+        # autrefois cherché dans les chatlogs, qui ne portent jamais de balise
+        # « (notify) » : les alertes WEB ne pouvaient donc jamais se déclencher.
+        # (« (notify) » figure déjà dans le filtre rapide ci-dessus, ces lignes
+        # parviennent donc bien jusqu'ici.)
         m = RE_WEB.search(raw)
         if m:
             npc = shtml(m.group(1).strip())
@@ -3347,7 +4220,7 @@ class CharacterWindow:
             self._flash_alert()
             return
 
-    # ── Polling loop (reads new log data) ────────────────────────────
+    # ── Boucle de lecture des logs ───────────────────────────────────────
     # Lit une fois les nouveaux logs (gamelog + detection de rotation).
     # Appelé par le timer _poll ET par le watchdog (sur événement fichier).
     def _read_logs_once(self):
@@ -3357,7 +4230,7 @@ class CharacterWindow:
             self._read()
             self._check_gamelog_rotation()
         except Exception:
-            pass
+            _log_exc("CharacterWindow._read_logs_once:3366")
 
     # Boucle de lecture des logs. Quand le watchdog est actif ce timer n'est
     # plus qu'un filet de sécurité lent (2 s) ; sinon c'est le lecteur principal
@@ -3366,7 +4239,7 @@ class CharacterWindow:
         try:
             self._read_logs_once()
         except Exception:
-            pass
+            _log_exc("CharacterWindow._poll:3375")
         interval = self.poll_ms
         mu = self._main_ui
         if mu is not None and getattr(mu, "_log_observer", None) is not None:
@@ -3384,7 +4257,7 @@ class CharacterWindow:
         d = self.data
         try: d.tax = max(0, min(float(self.tax_var.get()) / 100, 1))
         except Exception:
-            pass
+            _log_exc("CharacterWindow._tick:3393")
 
         if self._st == "stopped" and self._frozen:
             main_isk = {"il": self.il, "sl": self.sl}
@@ -3398,23 +4271,24 @@ class CharacterWindow:
             self._tick_job = self.root.after(self.poll_ms, self._tick)
             return
 
-        # Live dirty-flag updates (main window)
-        isk_text = f"{fisk(d.isk())} ISK" if d.secs() >= 60 and d.bg > 0 else "\u2014 STANDBY \u2014"
-        if self._last_values.get("isk_hr") != isk_text:
-            self._last_values["isk_hr"] = isk_text
-            fg = CI if d.secs() >= 60 and d.bg > 0 else (CP if self._st == "paused" else TD)
-            font = self._isk_font_big if d.secs() >= 60 and d.bg > 0 else self._isk_font_calc
-            self.il.config(text=isk_text, fg=fg, font=font)
+        # Mise à jour de la fenêtre principale, uniquement là où une valeur a changé.
+        live = d.secs() >= 60 and d.bg > 0
+        isk_text = f"{fisk(d.isk())} ISK" if live else "\u2014 STANDBY \u2014"
+        # _cset plutôt que l'ancienne garde _last_values : _show_calc_on() écrit lui
+        # aussi dans self.il, et deux caches indépendants pour un même label
+        # pouvaient diverger et le laisser figé sur une image de CALC périmée.
+        self._cset(self.il, text=isk_text,
+                   fg=CI if live else (CP if self._st == "paused" else TD),
+                   font=self._isk_font_big if live else self._isk_font_calc)
 
         timer_text = fdur(d.secs()) if (d.t0 or d.acc_sec > 0) else "00:00"
-        if self._last_values.get("timer") != timer_text:
-            self._last_values["timer"] = timer_text
-            self.sl.config(text=timer_text)
+        self._cset(self.sl, text=timer_text)
 
         dd = d.dps(True)
         dr = d.dps(False)
-        # Track the session PEAK continuously — _stop() alone only captured the
-        # instantaneous DPS at the moment Stop was pressed, missing real spikes.
+        # Le PIC de session est suivi en continu : ne le relever qu'au moment du Stop
+        # ne capturait que le DPS instantané de cet instant précis, et manquait donc
+        # les vrais pics du combat.
         if dd > d.pkd: d.pkd = dd
         if dr > d.pkr: d.pkr = dr
 
@@ -3435,14 +4309,16 @@ class CharacterWindow:
 
         self._tick_job = self.root.after(self.poll_ms, self._tick)
 
-    # ── Stop session & freeze display ────────────────────────────────
-    # Arrête la session et gèle l'affichage avec les données finales
+    # ── Arrêt de session et gel de l'affichage ───────────────────────────
+    # Stop GÈLE, il n'archive pas. Le joueur veut lire ses totaux tranquillement
+    # après un site sans que les chiffres continuent de bouger. L'instantané
+    # `_frozen` sert exactement à ça ; c'est Reset ou Next Site qui archivent.
     def _stop(self):
         if self._st == "stopped": return
         d = self.data
         try: d.tax = max(0, min(float(self.tax_var.get()) / 100, 1))
         except Exception:
-            pass
+            _log_exc("CharacterWindow._stop:3451")
 
         if self._st == "running" and d.t0:
             d.acc_sec += (datetime.now(timezone.utc) - d.t0).total_seconds()
@@ -3459,7 +4335,7 @@ class CharacterWindow:
         if d.anom_current and self._anom_start_wall:
             self._anom_paused_secs = time.monotonic() - self._anom_start_wall
 
-        a_n, a_avg_t, a_avg_i, a_best, _ = self._anom_stats()
+        a_n, a_avg_t, a_avg_i, a_best, _, a_loot, a_per_site = self._anom_stats()
         a_cur = self._anom_paused_secs
 
         self._frozen = {
@@ -3467,11 +4343,15 @@ class CharacterWindow:
             "isk_text": f"{fisk(d.isk())} ISK" if d.secs() >= 60 and d.bg > 0 else "\u2014 STOPPED \u2014",
             "isk_fg":   CI if (d.secs() >= 60 and d.bg > 0) else TD,
             "isk_font": "big" if (d.secs() >= 60 and d.bg > 0) else "calc",
-            "gross":    f"{fiskf(d.bg)} ISK",
-            "taxes":    f"-{fiskf(d.bg*d.tax)} ISK",
+            # Grandeurs BRUTES et non préformatées : _update_breakdown_labels
+            # choisit la notation selon la largeur disponible, et il peut
+            # devoir en changer alors que la fenêtre est déjà figée (on peut
+            # toujours la redimensionner après un Stop).
+            "gross_v":  float(d.bg),
+            "taxes_v":  float(d.bg * d.tax),
             "kills":    str(d.bc),
-            "loot":     f"{fiskf(d.loot_val)} ISK",
-            "total_net":f"{fiskf(d.bg*(1-d.tax) + d.loot_val)} ISK",
+            "loot_v":   float(d.loot_val),
+            "net_v":    float(d.bg * (1 - d.tax) + d.loot_val),
             "dps_out":  f"{dd:,.0f}",
             "dps_in":   f"{dr:,.0f}",
             "peak_d":   f"PEAK: {d.pkd:,.0f}",
@@ -3486,13 +4366,17 @@ class CharacterWindow:
             "anom_avg_isk":  fisk(a_avg_i) if a_avg_i > 0 else "\u2014",
             "anom_best_isk": fisk(a_best)  if a_best > 0  else "\u2014",
             "anom_cur_time": fdur(a_cur)   if a_cur > 0   else "\u2014",
+            "anom_run_loot": fisk(a_loot)     if a_loot > 0     else "\u2014",
+            "anom_isk_site": fisk(a_per_site) if a_per_site > 0 else "\u2014",
         }
 
         self._st = "stopped"
         self._update_buttons()
 
-    # ── Session management ──────────────────────────────────────────
-    # Sauvegarde la session et remet tout à zéro
+    # ── Gestion des sessions ─────────────────────────────────────────────
+    # Archive la session puis repart de zéro. Le point de bascule entre « ce que
+    # je viens de faire » et « ce que je vais faire » : c'est ici qu'une ligne
+    # d'historique naît, et c'est le seul moment où les totaux sont perdus.
     def _reset(self):
         d = self.data
         char_name = self.char_name
@@ -3501,35 +4385,40 @@ class CharacterWindow:
             tax_pct = DEF_TAX
         try: d.tax = max(0, min(float(self.tax_var.get()) / 100, 1))
         except Exception:
-            pass
+            _log_exc("CharacterWindow._reset:3510")
         self._anom_close_current()
         if not self._session_saved:
             save_session(d, char_name, tax_pct)
-        self._session_saved = False
+            # Ce drapeau était remis à False ici, donc il n'était jamais True nulle part
+            # et la garde de _quit() ne servait à rien. Rien n'était sauvegardé deux fois,
+            # mais seulement parce que data.reset() ci-dessous met à zéro les totaux que
+            # _quit() teste. _go() le remet à False au début de la session suivante.
+            self._session_saved = True
         self.data.reset()
+        # La session sauvegardée juste au-dessus fige les imports de butin : on
+        # ne peut plus les défaire sans désaccorder l'historique. La pile repart
+        # donc vide, comme loot_val.
+        self._loot_stack.clear()
+        self._refresh_undo_btn()
         self._frozen = None
         self._anom_paused_secs = 0
         if self.fh:
             self.fh.close()
             self.fh = None
         self.fp = 0
-        # Keep self.cf (the character's gamelog path) intact so Play (_go) can
-        # restart the same character — closing fh forces _go to re-open from EOF.
+        # On conserve self.cf, le chemin du gamelog : Play doit pouvoir relancer LE
+        # MÊME personnage. Fermer le descripteur suffit à forcer _go à rouvrir le
+        # fichier en sautant à la fin.
         self._st = "stopped"
         self._update_buttons()
 
-    # Sauvegarde la session et réinitialise pour le prochain site
+    # Même chose que Reset, mais nommé pour l'usage réel : on enchaîne les
+    # anomalies et on veut une ligne d'historique PAR SITE, pas par soirée.
+    # Délègue à _reset pour que les deux ne puissent jamais diverger.
     def _next_site(self):
-        # Identical behaviour to RESET — save the session, then clear all
-        # counters/state. Delegates to _reset so the two can never drift apart.
+        # Comportement identique à RESET : archiver la session puis tout remettre à
+        # zéro. Délégué à _reset pour que les deux ne puissent jamais diverger.
         self._reset()
-
-    # Ouvre la fenêtre de paramètres (ou la met au premier plan)
-    def _settings(self):
-        if self._sw and self._sw.w.winfo_exists():
-            self._sw.w.lift()
-            return
-        self._sw = Settings(self.root, self)
 
     # Ouvre la fenêtre d'historique (ou la met au premier plan)
     def _show_history(self):
@@ -3538,9 +4427,17 @@ class CharacterWindow:
             return
         self._hw = HistoryWindow(self.root, self, char_name=self.char_name)
 
-    # Relit le log courant pour récupérer les bounties récentes et initialiser le compteur de session
+    # Rattrapage au moment du Play : dans la vraie vie, on commence à ratter
+    # puis on pense à lancer l'app. Sans ça, les premières minutes de gains
+    # seraient perdues et l'ISK/heure démarrerait faux.
+    # Le t0 de session est reculé jusqu'à la plus ancienne bounty retrouvée,
+    # sinon on diviserait des gains de 15 minutes par 10 secondes de session.
     def _backfill_bounties(self):
-        """Scan gamelog for bounties from the last BACKFILL_MINS minutes and add them to the session."""
+        """Récupère les bounties des BACKFILL_MINS dernières minutes du gamelog.
+
+        On lance rarement l'app avant de commencer à ratter : sans ce rattrapage,
+        les premières minutes de gains seraient perdues et l'ISK/heure faux.
+        """
         if not self.cf or not os.path.exists(self.cf):
             return
         
@@ -3550,8 +4447,9 @@ class CharacterWindow:
         total_isk = 0
         
         try:
-            # Stream the file line-by-line instead of readlines() so a long
-            # session's multi-MB gamelog isn't fully materialised on the UI thread.
+            # Lecture ligne à ligne plutôt que readlines() : le gamelog d'une longue
+            # session pèse plusieurs mégaoctets, qu'on ne veut pas charger d'un bloc en
+            # mémoire sur le thread de l'interface.
             with open(self.cf, "r", encoding="utf-8", errors="replace") as f:
                 for raw in f:
                     raw = raw.rstrip("\n\r")
@@ -3567,7 +4465,8 @@ class CharacterWindow:
                     except Exception:
                         continue
 
-                    # Skip lines older than cutoff
+                    # On ignore ce qui précède la fenêtre de rattrapage : au-delà, ces bounties
+                    # appartiennent à une session antérieure.
                     if ts < cutoff:
                         continue
 
@@ -3577,9 +4476,9 @@ class CharacterWindow:
                         amt = pnum(m.group(1))
                         self.data.bg += amt
                         self.data.bc += 1
-                        # Drive the anomaly (site) state machine too, mirroring the
-                        # live _parse path, so backfilled kills populate site
-                        # count/ISK instead of leaving the anomaly panel at zero.
+                        # La machine à états des anomalies est alimentée elle aussi, à l'identique du
+                        # chemin temps réel : sans ça, les kills rattrapés laisseraient le panneau
+                        # des anomalies à zéro alors que des sites ont bel et bien été faits.
                         self._anom_combat_event(ts)
                         self._anom_add_bounty(ts, amt)
                         bounties_found += 1
@@ -3596,25 +4495,28 @@ class CharacterWindow:
                 self.data.alerts.append((now_str, "INFO", f"Backfilled {bounties_found} kills ({fiskf(total_isk)} ISK)"))
         
         except Exception:
-            pass
+            _log_exc("CharacterWindow._backfill_bounties:3602")
 
-    # Lit les nouvelles lignes du fichier log depuis la dernière position
+    # Lecture INCRÉMENTALE : on garde la position dans le fichier et on ne lit
+    # que ce qui s'y est ajouté. Un gamelog de plusieurs heures pèse des
+    # mégaoctets, le relire en entier à chaque tour serait impensable.
     def _read(self):
         fh = self.fh
         if not fh: return
 
-        # self.fp was repositioned by someone else (Play's seek-to-EOF, _reset,
-        # gamelog rotation) → any carried partial line belongs to a stale offset.
+        # self.fp a été repositionné ailleurs (saut en fin de fichier au Play, _reset,
+        # rotation du gamelog) : la ligne partielle conservée se rapporte alors à une
+        # position périmée et doit être jetée.
         if self.fp != self._read_seen_fp:
             self._read_buf  = ""
             self._read_size = -1
 
         try:
-            # Truncation guard. If the file shrank (replaced or truncated in
-            # place) our saved offset now points past EOF, seek() lands beyond
-            # the end and the reader goes permanently deaf — restart from the
-            # top. Compared against the last observed BYTE SIZE, not against
-            # self.fp: text-mode tell() returns an opaque cookie, not an offset.
+            # Garde contre la troncature. Si le fichier a rétréci (remplacé ou tronqué sur
+            # place), la position enregistrée dépasse la fin : seek() atterrit au-delà et
+            # le lecteur devient définitivement sourd. On repart donc du début.
+            # La comparaison porte sur la dernière TAILLE EN OCTETS observée, et non sur
+            # self.fp : en mode texte, tell() renvoie un jeton opaque, pas un décalage.
             size = os.fstat(fh.fileno()).st_size
             if 0 <= self._read_size and size < self._read_size:
                 self.fp = 0
@@ -3631,10 +4533,11 @@ class CharacterWindow:
         if not chunk:
             return
 
-        # Only hand complete lines to _parse; keep the trailing fragment for the
-        # next read. This matters more since the watchdog landed — reads now fire
-        # on every flush instead of on a 250 ms timer, so catching EVE mid-write
-        # is common rather than rare.
+        # On ne transmet à _parse que des lignes COMPLÈTES, et on garde le fragment de
+        # fin pour la lecture suivante. C'est devenu bien plus important depuis le
+        # passage au watchdog : les lectures se déclenchent à chaque vidage de tampon
+        # et non plus toutes les 250 ms, donc surprendre EVE en pleine écriture est
+        # désormais courant plutôt qu'exceptionnel.
         buf = self._read_buf + chunk
         cut = buf.rfind("\n")
         if cut == -1:
@@ -3657,9 +4560,9 @@ class CharacterWindow:
         if not self.cf:
             return
         try:
-            # Reuse MainUI's shared scan when available: otherwise every
-            # CharacterWindow walked the whole Gamelogs tree on its own 5 s
-            # rotation check — N full directory walks instead of one.
+            # On réutilise le balayage partagé de MainUI quand il existe : sinon chaque
+            # fenêtre de personnage parcourait tout l'arbre Gamelogs pour son propre
+            # contrôle de rotation toutes les 5 s — N parcours complets au lieu d'un.
             mu = self._main_ui
             if mu is not None:
                 latest = mu._scan_map().get(self.char_id)
@@ -3679,7 +4582,7 @@ class CharacterWindow:
             if self.fh:
                 self.fh.close()
         except Exception:
-            pass
+            _log_exc("CharacterWindow._check_gamelog_rotation:3685")
         try:
             self.fh = open(latest, "r", encoding="utf-8", errors="replace")
             self.fp = 0                       # nouveau fichier de session — lire depuis le début
@@ -3689,39 +4592,48 @@ class CharacterWindow:
         except Exception:
             self.fh = None
 
-    # NOTE — the chatlog reader that used to live here was removed.
-    # It matched chatlog files named 'Agent_*.txt' to scrape agent
-    # conversations, but EVE names chatlogs after the CHANNEL
-    # ('Local_<date>_<time>_<charid>.txt'), and agent conversations are not
-    # chat channels, so no such file is ever written: 17 000+ chatlogs across
-    # 55 channel names on this install contained zero 'Agent_' files. The two
-    # things it fed were WEB alerts — which needed a '(notify)' tag that
-    # chatlog lines never carry, and now correctly live in _parse() against
-    # the gamelog — and Data.mission_name, which EVE gives no log source for.
+    # NOTE — le lecteur de chatlogs qui vivait ici a été retiré.
+    # Il cherchait des fichiers nommés « Agent_*.txt » pour y lire les
+    # conversations d'agent, mais EVE nomme ses chatlogs d'après le CANAL
+    # (« Local_<date>_<heure>_<charid>.txt »), et une conversation d'agent n'est
+    # pas un canal de discussion : aucun fichier de ce nom n'est donc jamais
+    # écrit. Vérifié sur cette installation — plus de 17 000 chatlogs répartis
+    # sur 55 noms de canaux, zéro fichier « Agent_ ».
+    # Il alimentait deux choses. Les alertes WEB, qui exigeaient une balise
+    # « (notify) » qu'une ligne de chat ne porte jamais — elles vivent
+    # désormais dans _parse(), sur le gamelog, là où elles fonctionnent.
+    # Et Data.mission_name, pour lequel EVE n'offre aucune source : le nom de
+    # la mission n'est écrit dans aucun log, donc rien ne peut le récupérer.
 
-    # Reconstruit entièrement l'interface en appliquant le thème courant sans perdre l'état
+    # Repeint chaque widget EN PLACE plutôt que de reconstruire l'interface.
+    # Sur une surcouche toujours au premier plan, une reconstruction produit un
+    # clignotement très visible ; et l'état (sections repliées, session en
+    # cours, position) survit gratuitement puisque rien n'est détruit.
     def _apply_theme_live(self):
-        """Re-colour every widget in-place — no rebuild, no flicker."""
+        """Repeint chaque widget en place — aucune reconstruction, aucun clignotement."""
 
-        # 1. Snapshot current (old) palette BEFORE updating globals
+        # 1. Photographier l'ANCIENNE palette AVANT de toucher aux globales : c'est
+        #    elle qui permettra de reconnaître les couleurs à remplacer.
         old = [BG, BG_P, BG_H, BG_C, BG_POP, BD, BDG,
                T0, T1, TB, TD, CD, CR, CG, CI, CT, CK, CW, CM,
                CA, CP, CS, CH, C_DETACH, C_MSN, C_ALERT, C_ESCAL, C_ANOM, C_EWAR]
 
-        # 2. Update globals to the new theme
+        # 2. Basculer les globales sur le nouveau thème
         apply_theme_colors(self._current_theme)
 
-        # 3. New palette (same order)
+        # 3. Nouvelle palette, dans le même ordre
         new = [BG, BG_P, BG_H, BG_C, BG_POP, BD, BDG,
                T0, T1, TB, TD, CD, CR, CG, CI, CT, CK, CW, CM,
                CA, CP, CS, CH, C_DETACH, C_MSN, C_ALERT, C_ESCAL, C_ANOM, C_EWAR]
 
-        # 4. Build old-hex → new-hex replacement map (only changed entries)
+        # 4. Table de correspondance ancien → nouveau, limitée aux teintes qui
+        #    changent vraiment : inutile de repeindre ce qui est identique.
         remap = {o.lower(): n for o, n in zip(old, new) if o.lower() != n.lower()}
         if not remap:
             return
 
-        # 5. Walk every widget and swap matching colours
+        # 5. Parcourir chaque widget et échanger les couleurs reconnues. C'est ce
+        #    parcours qui évite de reconstruire l'interface, donc de la faire clignoter.
         PROPS = ('bg', 'fg', 'highlightbackground', 'highlightcolor',
                  'insertbackground', 'selectbackground',
                  'activebackground', 'activeforeground')
@@ -3733,7 +4645,7 @@ class CharacterWindow:
                     if isinstance(v, str) and v.lower() in remap:
                         widget.config(**{prop: remap[v.lower()]})
                 except Exception:
-                    pass
+                    _log_exc("CharacterWindow._apply_theme_live._walk:3739")
             for child in widget.winfo_children():
                 _walk(child)
 
@@ -3754,10 +4666,11 @@ class CharacterWindow:
                                         highlightbackground=BDG,
                                         highlightcolor=BDG)
                 except Exception:
-                    pass
+                    _log_exc("CharacterWindow._apply_theme_live:3760")
 
-        # DPS overlay (owned by MainUI) — keep its color-keyed background and
-        # re-assert its mode chrome (backdrop / contour / ✕ / grip) after the walk.
+        # L'overlay DPS appartient à MainUI : on préserve son fond en couleur-clé et
+        # on réapplique l'habillage de son mode (fond, contour, ✕, poignée) après le
+        # parcours, sinon le repeignage le rendrait opaque.
         try:
             _mu = getattr(self, "_main_ui", None)
             ov = _mu._overlays.get(self.char_id) if _mu else None
@@ -3766,23 +4679,27 @@ class CharacterWindow:
                 ov.w.configure(bg=OVERLAY_KEY)
                 ov._apply_mode()
         except Exception:
-            pass
+            _log_exc("CharacterWindow._apply_theme_live:3772")
 
-        # Settings / History Toplevels (if open)
-        for attr in ('_sw', '_hw'):
+        # History Toplevel (if open)
+        for attr in ('_hw',):
             obj = getattr(self, attr, None)
             if obj:
                 try:
                     if obj.w.winfo_exists():
                         _walk(obj.w)
                 except Exception:
-                    pass
+                    _log_exc("CharacterWindow._apply_theme_live:3782")
 
-        # 6. Refresh ttk combobox style and button states
+        # 6. Rafraîchir le style ttk et l'état des boutons : ils ne suivent pas le
+        #    parcours ci-dessus, leurs couleurs vivant dans un style à part.
         self._style()
         self._update_buttons()
 
-    # Démarre ou reprend la session de ratting pour le personnage sélectionné
+    # Play, qui recouvre deux cas : DÉMARRER une session (on ouvre le log en
+    # sautant à la fin, pour ne pas compter l'historique du fichier, puis on
+    # rattrape les 15 dernières minutes) et REPRENDRE après une pause (on
+    # reprend le chrono là où il s'était arrêté).
     def _go(self):
         if not self.cf:
             return
@@ -3821,7 +4738,9 @@ class CharacterWindow:
                 self._anom_last_wall  = time.monotonic()
                 self._anom_start_wall = time.monotonic() - self._anom_paused_secs
 
-    # Met en pause la session (fige les timers) ou la reprend si déjà en pause
+    # Pause fige le CHRONO, pas la lecture. Sert aux trajets et aux ravitaillements :
+    # sans elle, dix minutes de warp feraient chuter l'ISK/heure alors que rien
+    # ne s'est passé. Le temps écoulé est versé dans acc_sec et t0 remis à None.
     def _pause(self):
         if self._st == "running":
             self._st = "paused"
@@ -3841,7 +4760,10 @@ class CharacterWindow:
             return
         self._update_buttons()
 
-    # Détache un panneau de la fenêtre principale dans sa propre fenêtre flottante
+    # Le détachement sert à composer sa propre disposition : on sort l'ISK sur
+    # un second écran, on garde les alertes près du jeu. La section est
+    # RECONSTRUITE dans la fenêtre flottante par la même fonction de
+    # construction, pour que les deux versions ne puissent pas diverger.
     def _detach(self, section):
         if section == "isk" and not self._isk_detached:
             self._isk_detached = True
@@ -3868,7 +4790,9 @@ class CharacterWindow:
             self._alert_window = DetachedWindow(self.root, self, "ALERTS", T0, "alert", lambda parent, detached: self._build_alerts(parent, detached=True), char_name=self.char_name)
             self._fit()
 
-    # Réintègre un panneau détaché dans la fenêtre principale et reconstruit son contenu
+    # Retour à la fenêtre principale. Les labels de la version flottante sont
+    # abandonnés et la section rebâtie : garder des références vers des widgets
+    # détruits ferait échouer la mise à jour suivante.
     def _reattach(self, section):
         if section == "isk":
             self._isk_detached = False
@@ -3911,13 +4835,17 @@ class CharacterWindow:
             self._fit()
 
     # Enregistre un événement de combat et crée/ferme une anomalie selon les gaps
+    # EVE ne signale NI le début NI la fin d'une anomalie. Tout le découpage en
+    # sites se déduit donc d'un seul signal : « il vient de se passer quelque
+    # chose de combat ». Un silence de plus de anom_gap secondes est interprété
+    # comme un warp vers le site suivant, et clôture le site courant.
     def _anom_combat_event(self, ts):
         d = self.data
         if d.anom_current and d.anom_last_combat:
             gap = (ts - d.anom_last_combat).total_seconds()
             if gap > self.anom_gap:
                 d.anom_current["end"] = d.anom_last_combat
-                d.anom_completed.append(d.anom_current)
+                d.archive_anom(d.anom_current)
                 d.anom_current = None
         if d.anom_current is None:
             d.anom_current = {"start": ts, "end": None, "kills": 0, "isk": 0}
@@ -3925,47 +4853,71 @@ class CharacterWindow:
         d.anom_last_combat = ts
         self._anom_last_wall = time.monotonic()
 
-    # Incrémente le compteur de kills et ISK de l'anomalie en cours
+    # L'ISK est rattachée au site EN COURS, ce qui permet de comparer les sites
+    # entre eux — le seul moyen de savoir lesquels valent le détour.
     def _anom_add_bounty(self, ts, amount):
         d = self.data
         if d.anom_current:
             d.anom_current["kills"] += 1
             d.anom_current["isk"]   += amount
 
-    # Ferme manuellement l'anomalie en cours et l'archive dans la liste des complétées
+    # Clôture manuelle, déclenchée par Next Site ou par la fin de session :
+    # le joueur sait que le site est fini avant que le silence ne le prouve.
     def _anom_close_current(self):
         d = self.data
         if d.anom_current:
             d.anom_current["end"] = d.anom_last_combat or datetime.now(timezone.utc)
-            d.anom_completed.append(d.anom_current)
+            d.archive_anom(d.anom_current)
             d.anom_current = None
 
-    # Vérifie si le gap de combat dépasse le seuil et clôture l'anomalie si nécessaire
+    # Contrôle appelé à chaque tick, en plus de celui fait à l'arrivée d'un
+    # événement : sans lui, un site resterait ouvert indéfiniment après le
+    # DERNIER combat, puisque plus aucune ligne ne viendrait déclencher le test.
     def _anom_check_gap(self):
         d = self.data
         if d.anom_current and self._anom_last_wall:
             gap = time.monotonic() - self._anom_last_wall
             if gap > self.anom_gap:
                 d.anom_current["end"] = d.anom_last_combat
-                d.anom_completed.append(d.anom_current)
+                d.archive_anom(d.anom_current)
                 d.anom_current = None
 
-    # Calcule et retourne les statistiques agrégées sur toutes les anomalies complétées
+    # Agrégats affichés par la section : nombre de sites, temps et ISK moyens,
+    # meilleur site. Le temps du site en cours est calculé à part, sur l'horloge
+    # monotone, pour qu'il défile même quand aucun combat n'a lieu.
     def _anom_stats(self):
         d = self.data
-        completed = d.anom_completed
-        n = len(completed)
-        if n > 0:
-            total_time = sum(max(0, (a["end"] - a["start"]).total_seconds()) for a in completed if a["end"] and a["start"])
-            avg_time = total_time / n
-        else:
-            avg_time = 0
-        avg_isk  = sum(a["isk"] for a in completed) / n if n > 0 else 0
-        best_isk = max((a["isk"] for a in completed), default=0)
+        # O(1) : les totaux sont cumulés par Data.archive_anom() à la clôture de
+        # chaque site, au lieu de trois parcours complets de anom_completed à chaque
+        # tick — une liste qui grandit pendant toute la session.
+        n = len(d.anom_completed)
+        avg_time = (d.anom_total_time / n) if n else 0
+        avg_isk  = (d.anom_total_isk / n) if n else 0
+        best_isk = d.anom_best_isk
         cur_secs = (time.monotonic() - self._anom_start_wall) if (d.anom_current and self._anom_start_wall) else 0
-        return n, avg_time, avg_isk, best_isk, cur_secs
 
-# ── Global settings popup (opened from MainUI header) ────────────────
+        # Butin de la passe. avg_isk ci-dessus ne voit QUE les bounties : le
+        # butin d'un MTU arrive en une seule cargaison pour tout un groupe de
+        # sites, il est donc impossible de l'attribuer site par site. On le
+        # rapporte au niveau du groupe — c'est-à-dire de la session — plutôt que
+        # d'inventer une répartition.
+        run_loot = d.loot_val
+
+        # Diviseur : sites clos PLUS celui en cours. Les bounties du site en
+        # cours sont DÉJÀ dans bg, donc le laisser hors du dénominateur gonflerait
+        # l'ISK par site pendant toute la durée du site.
+        div = n + (1 if d.anom_current else 0)
+        isk_per_site = ((d.bg * (1 - d.tax) + d.loot_val) / div) if div else 0
+
+        return n, avg_time, avg_isk, best_isk, cur_secs, run_loot, isk_per_site
+
+# ── Réglages globaux (bouton engrenage) ──────────────────────────────
+# Unique fenêtre de réglages de l'app. Tout ce qu'elle contient est PARTAGÉ par
+# toute la flotte (chemin des logs, taxe, intervalle, seuil de site) sauf le
+# thème, qui se retient par personnage.
+# Le bouton APPLY reste grisé tant que rien n'a changé : sans ce retour, on ne
+# sait pas si un réglage a été pris en compte, et l'app le réécrirait sur le
+# disque à chaque ouverture de la fenêtre.
 class MainUISettings:
 
     def __init__(self, parent_root, main_ui):
@@ -4035,6 +4987,23 @@ class MainUISettings:
         self.tv = tk.StringVar(value=cfg.get("tax", str(DEF_TAX)))
         tk.Entry(r2, textvariable=self.tv, width=8, **ek).pack(side="right")
 
+        # Déplacés depuis l'ancienne fenêtre de réglages « par personnage », qui était
+        # inatteignable (personne n'appelait CharacterWindow._settings) : ces deux
+        # réglages restaient donc figés sur leur valeur par défaut, sans aucun moyen
+        # de les changer. Tous deux écrivent des clés partagées, exactement comme le
+        # faisait cette fenêtre.
+        r4 = tk.Frame(body, bg=BG_POP)
+        r4.pack(fill="x", pady=(0, 6))
+        tk.Label(r4, text="UPDATE INTERVAL (ms)", font=lf, bg=BG_POP, fg=TD).pack(side="left")
+        self.iv = tk.StringVar(value=str(cfg.get("poll_ms", DEF_POLL)))
+        tk.Entry(r4, textvariable=self.iv, width=8, **ek).pack(side="right")
+
+        r5 = tk.Frame(body, bg=BG_POP)
+        r5.pack(fill="x", pady=(0, 6))
+        tk.Label(r5, text="SITE GAP (sec)", font=lf, bg=BG_POP, fg=TD).pack(side="left")
+        self.gv = tk.StringVar(value=str(cfg.get("anom_gap", ANOM_GAP)))
+        tk.Entry(r5, textvariable=self.gv, width=8, **ek).pack(side="right")
+
         tk.Label(body, text="THEME", font=lf, bg=BG_POP, fg=TD).pack(
             anchor="w", pady=(0, 2))
         self._theme_var = tk.StringVar(value=cfg.get("last_theme", THEME_DEFAULT))
@@ -4063,11 +5032,14 @@ class MainUISettings:
         self._bgm_box.bind("<Button-1>", _toggle_bgm)
         bgm_lbl.bind("<Button-1>", _toggle_bgm)
 
-        # Snapshot of values at open time — used to detect changes
+        # Photographie des valeurs à l'ouverture : c'est la référence qui permet de
+        # savoir s'il reste quelque chose à appliquer.
         self._snap = {
             "log":   self.pv.get(),
             "alpha": self.av.get(),
             "tax":   self.tv.get(),
+            "poll":  self.iv.get(),
+            "gap":   self.gv.get(),
             "theme": self._theme_var.get(),
             "bgm":   self.bgm_var.get(),
         }
@@ -4079,14 +5051,19 @@ class MainUISettings:
         self._ap_dirty = False
 
         # Trace StringVars so any keystroke updates dirty state
-        for var in (self.pv, self.av, self.tv, self._theme_var):
+        for var in (self.pv, self.av, self.tv, self.iv, self.gv, self._theme_var):
             var.trace_add("write", lambda *_: self._check_dirty())
 
+    # Comparé à l'instantané pris à l'ouverture plutôt qu'à la config : le
+    # joueur peut modifier un champ puis revenir à la valeur d'origine, et dans
+    # ce cas il n'y a plus rien à appliquer.
     def _check_dirty(self):
         dirty = (
             self.pv.get()          != self._snap["log"]   or
             self.av.get()          != self._snap["alpha"] or
             self.tv.get()          != self._snap["tax"]   or
+            self.iv.get()          != self._snap["poll"]  or
+            self.gv.get()          != self._snap["gap"]   or
             self._theme_var.get()  != self._snap["theme"] or
             self.bgm_var.get()     != self._snap["bgm"]
         )
@@ -4111,26 +5088,41 @@ class MainUISettings:
                 f"+{self.w.winfo_x()}+{self.w.winfo_y()}")
             save_config(self.main_ui.cfg)
         except Exception:
-            pass
+            _log_exc("MainUISettings._save_pos:4134")
 
+    # Les réglages sont poussés DANS LES FENÊTRES VIVANTES en plus d'être
+    # écrits sur le disque : elles ont lu la config à leur construction et ne la
+    # relisent jamais, donc sans cette propagation il faudrait relancer l'app.
     def _apply(self):
         mu  = self.main_ui
         cfg = mu.cfg
         cfg["log_path"]  = self.pv.get().strip()
+        try:
+            cfg["poll_ms"] = max(100, int(self.iv.get()))
+        except Exception:
+            _log_exc("MainUISettings._apply:4143")
+        try:
+            cfg["anom_gap"] = max(5, int(self.gv.get()))
+        except Exception:
+            _log_exc("MainUISettings._apply:4147")
         for win in mu._windows.values():
             win.log_path  = cfg["log_path"]
-        # Re-point the watchdog observer at the new directory
+            win.poll_ms   = cfg.get("poll_ms",  DEF_POLL)
+            win.anom_gap  = cfg.get("anom_gap", ANOM_GAP)
+        # On redirige l'observateur vers le nouveau dossier : il surveille un chemin
+        # figé à son démarrage et ne le relit jamais.
         try:
             mu._start_log_observer()
         except Exception:
-            pass
+            _log_exc("MainUISettings._apply:4156")
 
         try:
             v     = max(20, min(100, int(self.av.get())))
             alpha = v / 100
             cfg["alpha"] = alpha
             mu.root.attributes("-alpha", alpha)
-            # Apply to this Settings window itself
+            # Appliqué à la fenêtre de réglages elle-même : elle doit refléter
+            # immédiatement le changement, sinon on ne voit pas l'effet de son propre geste.
             if self.w.winfo_exists():
                 self.w.attributes("-alpha", alpha)
             # Apply to Fleet Manager if open
@@ -4150,7 +5142,7 @@ class MainUISettings:
                 if ov and ov.w.winfo_exists():
                     ov.apply_alpha(alpha)
         except Exception:
-            pass
+            _log_exc("MainUISettings._apply:4183")
 
         try:
             tax_str = self.tv.get().strip()
@@ -4159,11 +5151,13 @@ class MainUISettings:
             for win in mu._windows.values():
                 win.tax_var.set(tax_str)
         except Exception:
-            pass
+            _log_exc("MainUISettings._apply:4192")
 
         new_theme = self._theme_var.get()
         if new_theme != cfg.get("last_theme", THEME_DEFAULT):
-            # Snapshot old palette BEFORE changing globals (must be done once for all windows)
+            # Photographier l'ancienne palette AVANT de changer les globales, une seule
+            # fois pour toutes les fenêtres : les globales étant partagées, un second
+            # relevé ne verrait déjà plus que le nouveau thème.
             old_pal = [BG, BG_P, BG_H, BG_C, BG_POP, BD, BDG,
                        T0, T1, TB, TD, CD, CR, CG, CI, CT, CK, CW, CM,
                        CA, CP, CS, CH, C_DETACH, C_MSN, C_ALERT, C_ESCAL, C_ANOM, C_EWAR]
@@ -4185,17 +5179,18 @@ class MainUISettings:
                         if isinstance(v, str) and v.lower() in remap:
                             widget.config(**{prop: remap[v.lower()]})
                     except Exception:
-                        pass
+                        _log_exc("MainUISettings._apply._walk:4218")
                 for child in widget.winfo_children():
                     _walk(child)
 
             if remap:
-                # MainUI overview window
+                # Fenêtre de vue d'ensemble
                 _walk(mu.root)
                 # Settings popup itself
                 if self.w.winfo_exists():
                     _walk(self.w)
-                # Every CharacterWindow + its detached panels + open popups
+                # Chaque fenêtre de personnage, ses panneaux détachés et ses popups ouverts :
+                # tout ce qui est à l'écran doit changer de thème d'un coup.
                 for win in mu._windows.values():
                     if not win.root.winfo_exists():
                         continue
@@ -4213,7 +5208,7 @@ class MainUISettings:
                     if ov and ov.w.winfo_exists():
                         _walk(ov.w)
                         ov.w.configure(bg=BG, highlightbackground=BDG, highlightcolor=BDG)
-                    for attr in ('_sw', '_hw'):
+                    for attr in ('_hw',):
                         obj = getattr(win, attr, None)
                         if obj and obj.w.winfo_exists():
                             _walk(obj.w)
@@ -4221,7 +5216,7 @@ class MainUISettings:
                         win._style()
                         win._update_buttons()
                     except Exception:
-                        pass
+                        _log_exc("MainUISettings._apply:4254")
 
         cfg["bg_monitor"] = self.bgm_var.get()
 
@@ -4232,13 +5227,19 @@ class MainUISettings:
             "log":   self.pv.get(),
             "alpha": self.av.get(),
             "tax":   self.tv.get(),
+            "poll":  self.iv.get(),
+            "gap":   self.gv.get(),
             "theme": self._theme_var.get(),
             "bgm":   self.bgm_var.get(),
         }
         self._check_dirty()
 
 
-# ── Fleet manager popup (add / remove characters from active fleet) ───
+# ── Gestionnaire de flotte ───────────────────────────────────────────
+# L'app détecte tout personnage ayant un gamelog, ce qui ramène aussi les alts
+# qu'on ne joue plus, les persos de test ou ceux d'un autre compte. Ce
+# gestionnaire sert à choisir lesquels comptent vraiment : un personnage ignoré
+# reste sur le disque mais ne consomme plus ni fenêtre ni analyse.
 class FleetManager:
 
     def __init__(self, parent_root, main_ui):
@@ -4315,7 +5316,8 @@ class FleetManager:
 
         tk.Frame(self.w, bg=BD, height=1).pack(fill="x", padx=10, pady=(0, 4))
 
-        # Refresh button at the bottom
+        # Bouton de rafraîchissement : un personnage peut se connecter pendant que la
+        # liste est ouverte.
         bot = tk.Frame(self.w, bg=BG)
         bot.pack(fill="x", padx=10, pady=(0, 8))
         refresh_lbl = tk.Label(bot, text="⟳ REFRESH",
@@ -4329,6 +5331,8 @@ class FleetManager:
         self._F9  = tkfont.Font(family="Consolas", size=9)
         self._populate()
 
+    # Reconstruit la liste à chaque ouverture : de nouveaux personnages
+    # apparaissent en cours de session, dès qu'on se connecte avec eux.
     def _populate(self):
         for w in self._list_frame.winfo_children():
             w.destroy()
@@ -4338,14 +5342,16 @@ class FleetManager:
         char_map = cfg.setdefault("chars", {})
         log_path = cfg.get("log_path", DEF_PATH)
 
-        # Scan logs fresh to get all known characters (including ignored ones)
+        # Balayage neuf pour retrouver TOUS les personnages connus, y compris les
+        # ignorés : c'est précisément ici qu'on veut pouvoir les réactiver.
         cf = scan_logs(log_path)
         if not cf:
             tk.Label(self._list_frame, text="No characters found in logs.",
                      font=self._F9, bg=BG, fg=TD).pack(padx=10, pady=6)
             return
 
-        # Merge: chars from logs + chars already in windows (in case log file gone)
+        # Fusion des personnages trouvés dans les logs et de ceux qui ont déjà une
+        # fenêtre : un pilote dont le log a été supprimé doit rester pilotable.
         all_chars = {}
         for char_id, log_file in cf.items():
             name = rlisten(log_file) or f"Unknown ({char_id})"
@@ -4377,6 +5383,9 @@ class FleetManager:
             btn.bind("<Enter>", lambda e, b=btn: b.config(fg=T0))
             btn.bind("<Leave>", lambda e, b=btn, a=active: b.config(fg=CI if a else CR))
 
+    # Bascule actif / ignoré. Activer un personnage crée sa fenêtre
+    # immédiatement, sans attendre le balayage automatique : le clic doit avoir
+    # un effet visible tout de suite.
     def _toggle(self, char_id: str, char_name: str, log_file: str):
         mu       = self.main_ui
         cfg      = mu.cfg
@@ -4386,17 +5395,19 @@ class FleetManager:
         currently_active = char_id in mu._windows
 
         if currently_active:
-            # Remove from fleet — close overlay + window and mark ignored
+            # Retrait de la flotte : on ferme l'overlay et la fenêtre, puis on marque le
+            # personnage comme ignoré pour qu'il ne revienne pas au prochain balayage.
             ov = mu._overlays.get(char_id)
             if ov:
                 try: ov.close()
-                except Exception: pass
+                except Exception: _log_exc("FleetManager._toggle:4426")
             win = mu._windows.pop(char_id, None)
             if win and win.root.winfo_exists():
                 win._quit()
             char_map[char_id]["ignored"] = True
         else:
-            # Add to fleet — clear ignored flag and spawn window
+            # Ajout à la flotte : on lève le drapeau « ignoré » et on crée la fenêtre
+            # tout de suite, pour que le clic ait un effet visible.
             char_map[char_id]["ignored"] = False
             if log_file and char_id not in mu._windows:
                 win = CharacterWindow(mu.root, mu, char_id, char_name, log_file, cfg)
@@ -4414,13 +5425,21 @@ class FleetManager:
                 f"+{self.w.winfo_x()}+{self.w.winfo_y()}")
             save_config(self.main_ui.cfg)
         except Exception:
-            pass
+            _log_exc("FleetManager._save_pos:4449")
 
 
-# ── Fleet overview ────────────────────────────────────────────────────
-# ── Watchdog handler: wakes log readers on real file I/O (optional) ───
+# ── Vue d'ensemble de la flotte ──────────────────────────────────────
+# ── Réveil des lecteurs sur événement fichier (watchdog) ─────────────
 class _LogEventHandler(FileSystemEventHandler):
-    """Debounced: coalesces bursts of file events into one read on the main thread."""
+    """Réveille les lecteurs quand EVE écrit vraiment dans un log.
+
+    Regroupe les rafales d'événements en UNE seule lecture : le client écrit
+    ligne par ligne et déclencherait autrement des dizaines de lectures par
+    seconde en plein combat.
+    Le travail est systématiquement renvoyé sur le thread principal via
+    after() — watchdog appelle ces méthodes depuis son propre thread, et Tk
+    n'est pas thread-safe.
+    """
     def __init__(self, main_ui):
         self._mu = main_ui
         self._pending = None
@@ -4433,7 +5452,7 @@ class _LogEventHandler(FileSystemEventHandler):
             try:
                 self._mu._wake_readers()
             except Exception:
-                pass
+                _log_exc("_LogEventHandler._schedule._fire:4468")
         try:
             self._pending = self._mu.root.after(300, _fire)
         except Exception:
@@ -4444,16 +5463,23 @@ class _LogEventHandler(FileSystemEventHandler):
             try:
                 self._mu.root.after(0, self._schedule)
             except Exception:
-                pass
+                _log_exc("_LogEventHandler.on_modified:4479")
 
     def on_created(self, event):
         self.on_modified(event)
 
 
+# Le hub. Il possède la racine Tk, découvre les personnages, crée et détruit
+# leurs fenêtres, et surveille leur santé.
+# Une racine UNIQUE pour toute l'app : chaque personnage est un Toplevel, pas
+# une application séparée. C'est ce qui permet de partager une seule boucle
+# d'événements, un seul observateur de fichiers et une seule lecture du
+# presse-papiers, au lieu de les multiplier par le nombre de pilotes.
 class MainUI:
 
-    MAIN_W    = 420   # default & minimum window width
-    # Treeview column pixel widths (fixed columns; char column stretches)
+    MAIN_W    = 420   # largeur par défaut ET minimale
+    # Largeurs fixes des colonnes ; seule la colonne du nom s'étire, parce que
+    # c'est la seule dont la longueur varie d'un joueur à l'autre.
     _TV_NET  = 100   # TOTAL NET (wide enough for the "TOTAL NET" header so it doesn't overflow)
     _TV_HR   = 85    # ISK/HR
     _TV_SES  = 68    # SESSION (HH:MM:SS)
@@ -4485,6 +5511,7 @@ class MainUI:
         self._rw = self._rh = self._rx = self._ry = self._wx = self._wy = 0
         self._last_clipboard  = ""  # shared across all CharacterWindows — first to see a paste wins
         self._clip_job        = None   # after() id for _poll_clipboard
+        self._clip_btn        = None   # glyphe de verrou dans l'en-tête (créé par _build)
 
         self._scan_job       = None
         self._scan_map_cache = None   # shared scan_logs() result (see _scan_map)
@@ -4498,9 +5525,10 @@ class MainUI:
         self._build()
         self._restore_geometry()
 
-        # Restore collapsed state if overview was closed while collapsed.
-        # _restore_geometry() already set the correct geometry (position + collapsed height).
-        # We must NOT call winfo_* here — the window is still withdrawn and returns garbage.
+        # Restauration de l'état replié si la vue d'ensemble a été fermée ainsi.
+        # _restore_geometry() a déjà posé la bonne géométrie (position et hauteur
+        # repliée). Il ne faut SURTOUT PAS appeler winfo_* ici : la fenêtre est encore
+        # masquée et ne renvoie que des valeurs sans signification.
         mui = self.cfg.get("main_ui", {})
         full_h = mui.get("full_height", 0)
         if mui.get("collapsed", False) and full_h > 32:
@@ -4520,7 +5548,7 @@ class MainUI:
         self.root.deiconify()
         self.root.mainloop()
 
-    # ── Scan logs — spawn a CharacterWindow for every new character ───
+    # ── Détection des personnages ────────────────────────────────────────
     # Résultat de scan_logs() partagé par toutes les fenêtres de personnage.
     # Sans ce cache, chaque CharacterWindow parcourait l'arbre Gamelogs pour son
     # propre contrôle de rotation toutes les 5 s — N parcours complets au lieu d'un.
@@ -4536,12 +5564,18 @@ class MainUI:
         self._scan_map_ts = now
         return self._scan_map_cache
 
+    # Aucun écran de configuration au premier lancement : on trouve les pilotes
+    # en lisant le dossier de logs. Un personnage déjà connu et non ignoré voit
+    # sa fenêtre recréée ; un inconnu passe par le sélecteur, pour éviter
+    # d'ouvrir d'office une fenêtre par alt jamais joué.
     def _scan(self):
         cf = self._scan_map()
         char_map = self.cfg.setdefault("chars", {})
         changed = False
 
-        # Collect truly new characters (never seen before — not in config at all)
+        # On ne retient que les personnages VRAIMENT nouveaux, absents de la config :
+        # les autres ont déjà été acceptés ou refusés une fois, et redemander serait
+        # pénible à chaque lancement.
         new_chars = {}   # char_id → (char_name, log_file)
         for char_id, log_file in cf.items():
             if char_id in self._windows:
@@ -4576,9 +5610,16 @@ class MainUI:
         if changed:
             self._rebuild_rows()
 
-    # ── Character picker popup — returns set of selected char_ids ────────
+    # ── Sélecteur de nouveaux personnages ────────────────────────────────
+    # Demandé UNE SEULE FOIS par personnage : le refus est mémorisé sous forme
+    # de drapeau « ignoré », sinon la même question reviendrait à chaque
+    # lancement pour des alts qu'on ne joue pas.
     def _show_char_picker(self, new_chars: dict) -> set:
-        """Modal dialog — user picks which new characters to add to the fleet."""
+        """Boîte modale de choix des nouveaux personnages.
+
+        Modale à dessein : la réponse conditionne la création des fenêtres, et
+        le refus est mémorisé pour ne pas reposer la question à chaque lancement.
+        """
         dlg = tk.Toplevel(self.root)
         dlg.title("Add Characters to Fleet")
         dlg.configure(bg=BG)
@@ -4630,7 +5671,8 @@ class MainUI:
         tk.Button(btn_row, text="Add Selected", font=F8B, bg=CI, fg=BG, relief="flat",
                   command=_confirm, padx=8, pady=3).pack(side="left")
 
-        # Centre over the main window
+        # Centrée sur la fenêtre appelante : une popup qui s'ouvrirait ailleurs sur un
+        # écran large passerait inaperçue.
         self.root.update_idletasks()
         rx = self.root.winfo_x() + self.root.winfo_width()  // 2
         ry = self.root.winfo_y() + self.root.winfo_height() // 2
@@ -4641,12 +5683,14 @@ class MainUI:
 
         return {cid for cid, v in vars_.items() if v.get()}
 
-    # ── Auto-scan every 10 s so new characters appear without a button ──
+    # ── Balayage périodique ──────────────────────────────────────────────
+    # On se connecte souvent avec un autre personnage APRÈS avoir lancé l'app :
+    # le balayage évite d'avoir à la redémarrer ou à chercher un bouton.
     def _auto_scan(self):
         self._scan()
         self._scan_job = self.root.after(10_000, self._auto_scan)
 
-    # ── Event-driven log watching (optional; falls back to timer polling) ──
+    # ── Surveillance des logs par événement ──────────────────────────────
     def _start_log_observer(self):
         """Watch the gamelog dir so reads fire on real I/O.
         No-op (pure polling) when the watchdog package isn't installed."""
@@ -4655,7 +5699,7 @@ class MainUI:
             try:
                 obs.stop(); obs.join(timeout=2.0)
             except Exception:
-                pass
+                _log_exc("MainUI._start_log_observer:4690")
             self._log_observer = None
         if not _WATCHDOG_OK:
             return
@@ -4672,16 +5716,18 @@ class MainUI:
         except Exception:
             self._log_observer = None
 
+    # Un seul observateur pour toute la flotte, qui réveille chaque lecteur.
+    # Le faire par personnage multiplierait les surveillances du même dossier.
     def _wake_readers(self):
-        """File event fired — read new log data for every live character window."""
+        """Un fichier a bougé : chaque fenêtre vivante relit sa portion de log."""
         for win in list(self._windows.values()):
             try:
                 if win.root.winfo_exists():
                     win._read_logs_once()
             except Exception:
-                pass
+                _log_exc("MainUI._wake_readers:4714")
 
-    # ── Build the overview window UI ─────────────────────────────────
+    # ── Construction de la vue d'ensemble ────────────────────────────────
     def _build(self):
         F8B  = tkfont.Font(family="Consolas", size=8,  weight="bold")
         F11B = tkfont.Font(family="Consolas", size=11, weight="bold")
@@ -4731,9 +5777,29 @@ class MainUI:
         fb.bind("<Leave>",    lambda e: fb.config(fg=TD))
         Tooltip(fb, "Fleet Manager")
 
+        # Verrou de presse-papiers. Le glyphe CHANGE en plus de la couleur : une
+        # simple nuance de rouge se rate d'un coup d'oeil, et le prix d'un
+        # verrou oublié est une soirée de butin non comptée.
+        self._clip_btn = tk.Label(hdr, text="▤", font=F11B,
+                                  bg=BG_H, fg=CI, padx=5, cursor="hand2")
+        self._clip_btn.pack(side="right", fill="y")
+        self._clip_btn.bind("<Button-1>", lambda e: self._set_clip_lock(not _CLIP_LOCK))
+        DynamicTooltip(
+            self._clip_btn,
+            lambda: ("Clipboard LOCKED - loot copies ignored (click to resume)"
+                     if _CLIP_LOCK else
+                     "Clipboard live - click to lock before copying a fit or appraisal"))
+        # Aligné sur l'état réel plutôt que laissé sur les valeurs de
+        # construction : celles-ci supposent le verrou ouvert, ce qui est vrai au
+        # démarrage normal mais ferait mentir le glyphe dès que l'en-tête est
+        # reconstruit ou le verrou armé avant l'affichage. Le bouton CLIP des
+        # fenêtres de personnage fait déjà pareil.
+        self._refresh_clip_btn()
+
         tk.Frame(self.root, bg=BDG, height=1).pack(fill="x")
 
-        # Resize grip — must be packed with side="bottom" BEFORE the expanding body
+        # Poignée empaquetée en bas AVANT le corps extensible : dans l'autre ordre, le
+        # corps prend toute la place et la poignée disparaît.
         btm = tk.Frame(self.root, bg=BG, height=14)
         btm.pack(fill="x", side="bottom")
         btm.pack_propagate(False)
@@ -4760,12 +5826,13 @@ class MainUI:
 
         tk.Frame(body, bg=BD, height=1).pack(fill="x", pady=(0, 2))
 
-        # ── Style Treeview to match the dark EVE theme ────────────────
+        # ── Treeview accordé au thème sombre d'EVE ──
         st = ttk.Style()
         st.theme_use("clam")
-        # Remove only the outer border wrapper from the layout.
-        # Keeping Treeview.treearea (via Treeview.padding) preserves tag colour
-        # rendering; removing Treeview.border eliminates the white highlight ring.
+        # On ne retire QUE l'enveloppe de bordure extérieure. Conserver
+        # Treeview.treearea (via Treeview.padding) préserve le rendu des couleurs de
+        # tag, tandis que supprimer Treeview.border fait disparaître l'anneau blanc de
+        # surbrillance qui jurait avec le thème sombre.
         st.layout("RatTV.Treeview", [
             ("Treeview.padding", {
                 "sticky": "nswe",
@@ -4800,9 +5867,10 @@ class MainUI:
         )
         tv = self._tree
 
-        # Headers + cells all centered (except CHARACTER, left) so each header sits
-        # centered over its value — center-over-center aligns by construction and
-        # avoids ttk's heading-vs-cell right-inset mismatch.
+        # En-têtes et cellules tous centrés, sauf CHARACTER aligné à gauche : chaque
+        # en-tête se retrouve ainsi centré au-dessus de sa valeur. Centre sur centre
+        # s'aligne par construction et contourne le décalage de marge droite que ttk
+        # applique différemment aux en-têtes et aux cellules.
         tv.heading("char",    text="CHARACTER", anchor="w", command=lambda: None)
         tv.heading("net",     text="TOTAL NET",  anchor="center", command=lambda: None)
         tv.heading("isk_hr",  text="ISK/HR",     anchor="center", command=lambda: None)
@@ -4815,10 +5883,12 @@ class MainUI:
         tv.column("session", stretch=False, minwidth=24,  width=self._TV_SES,  anchor="center")
         tv.column("dps",     stretch=False, minwidth=24,  width=self._TV_DPS,  anchor="center")
 
-        # Restore any user-customised column widths from a previous session.
+        # Largeurs de colonnes personnalisées, restaurées d'une session à l'autre :
+        # les redimensionner à chaque lancement serait vite lassant.
         self._restore_col_widths()
 
-        # Green ★ = window visible, orange ★ = window hidden
+        # ★ verte = fenêtre visible, ★ orange = fenêtre masquée. La couleur suffit à
+        # lire l'état sans ajouter de colonne.
         tv.tag_configure("vis", foreground=CI)
         tv.tag_configure("hid", foreground=CW)
 
@@ -4849,7 +5919,11 @@ class MainUI:
 
         self.root.bind("<Configure>", self._on_main_resize)
 
-    # ── Rebuild all character rows in the Treeview ───────────────────
+    # ── Lignes du tableau ────────────────────────────────────────────────
+    # Reconstruction complète des lignes, réservée aux changements de COMPOSITION
+    # de la flotte (arrivée ou départ d'un pilote). Les valeurs, elles, sont
+    # mises à jour cellule par cellule par _tv_set — reconstruire le tableau
+    # quatre fois par seconde le ferait scintiller et perdrait la sélection.
     def _rebuild_rows(self):
         tv = self._tree
         for iid in tv.get_children():
@@ -4872,17 +5946,31 @@ class MainUI:
         self.root.update_idletasks()
         self._resize_char_col()
 
-    # ── Treeview helpers ──────────────────────────────────────────────
+    # ── Accès au tableau ─────────────────────────────────────────────────
+    # Écrit une cellule seulement si sa valeur change : le contrôle de santé
+    # passe sur toutes les lignes deux fois par seconde, et réécrire des valeurs
+    # identiques ferait travailler Tk pour rien.
     def _tv_set(self, iid: str, col: str, value: str):
-        """Update a Treeview cell only when the value actually changed."""
+        """N'écrit une cellule que si sa valeur change vraiment.
+
+        Le contrôle de santé parcourt toutes les lignes deux fois par seconde ;
+        réécrire des valeurs identiques ferait travailler Tk pour rien.
+        """
         key = (iid, col)
         if self._tv_cache.get(key) == value:
             return
         self._tv_cache[key] = value
         self._tree.set(iid, col, value)
 
+    # L'état du pilote passe par la COULEUR de la ligne : on doit pouvoir lire
+    # d'un coup d'œil qui ratte, qui est en pause et qui est masqué, sans
+    # déchiffrer une colonne de texte.
     def _tv_tag(self, iid: str, state: str, visible: bool):
-        """Tag the 4 data columns by visibility only (state is for future use)."""
+        """Colore la ligne selon la visibilité de la fenêtre.
+
+        Le paramètre `state` est accepté mais pas encore exploité : il est prévu
+        pour distinguer un jour actif / pause / arrêté par la couleur.
+        """
         tag = "vis" if visible else "hid"
         key = (iid, "__tag__")
         if self._tv_cache.get(key) == tag:
@@ -4890,8 +5978,15 @@ class MainUI:
         self._tv_cache[key] = tag
         self._tree.item(iid, tags=(tag,))
 
+    # Le Treeview ne dit pas quelle colonne a été cliquée : il faut la retrouver
+    # à partir de l'abscisse. Nécessaire parce que la cellule DPS a son propre
+    # comportement, distinct du reste de la ligne.
     def _tv_col_name(self, event):
-        """Logical column name under the pointer (or None)."""
+        """Nom logique de la colonne sous le curseur, ou None.
+
+        Le Treeview ne le dit pas : il faut le déduire de l'abscisse du clic.
+        Nécessaire parce que la cellule DPS a son propre comportement.
+        """
         try:
             cols = self._tree["columns"]
             cid = self._tree.identify_column(event.x)   # like "#5"
@@ -4899,12 +5994,13 @@ class MainUI:
             if 0 <= idx < len(cols):
                 return cols[idx]
         except Exception:
-            pass
+            _log_exc("MainUI._tv_col_name:4934")
         return None
 
     def _on_row_click(self, event):
-        """Left-click the DPS cell → toggle that character's DPS overlay;
-        any other cell → toggle the character's dashboard window."""
+        """Clic gauche sur la cellule DPS → ouvre ou ferme l'overlay du personnage ;
+        sur toute autre cellule → affiche ou masque sa fenêtre de tableau de bord.
+        """
         iid = self._tree.identify_row(event.y)
         if not iid or self._tree.identify_region(event.x, event.y) != "cell":
             return
@@ -4914,8 +6010,12 @@ class MainUI:
             self._toggle_window(iid)
 
     def _on_row_right(self, event):
-        """Right-click the DPS cell → overlay context menu
-        (open / reposition / view / close)."""
+        """Clic droit sur la cellule DPS → menu contextuel de l'overlay
+        (ouvrir / repositionner / changer de vue / fermer).
+
+        Une fois posé, l'overlay est traversant à la souris : ce menu est le
+        SEUL moyen de le repiloter.
+        """
         iid = self._tree.identify_row(event.y)
         if not (iid and self._tree.identify_region(event.x, event.y) == "cell"
                 and self._tv_col_name(event) == "dps"):
@@ -4942,7 +6042,10 @@ class MainUI:
         finally:
             m.grab_release()
 
-    # ── DPS overlay management ────────────────────────────────────────
+    # ── Gestion des overlays DPS ─────────────────────────────────────────
+    # L'overlay s'ouvre et se ferme depuis la cellule DPS de la vue d'ensemble :
+    # une fois posé, il devient traversant à la souris, donc il ne peut PAS
+    # offrir lui-même de quoi le refermer.
     def _toggle_overlay(self, char_id):
         win = self._windows.get(char_id)
         if not win or not win.root.winfo_exists():
@@ -4958,7 +6061,11 @@ class MainUI:
         self._reflect_overlay_state(char_id)
 
     def _restore_overlay(self, char_id):
-        """Idempotently re-open an overlay if the character's config says it was open."""
+        """Rouvre l'overlay si la config du personnage indique qu'il l'était.
+
+        Idempotent : appelé à plusieurs moments du démarrage, il ne doit jamais
+        créer un second overlay pour le même pilote.
+        """
         win = self._windows.get(char_id)
         if not win or self._overlays.get(char_id):
             return
@@ -4974,8 +6081,15 @@ class MainUI:
             win._overlay_active = False
         self._reflect_overlay_state(char_id)
 
+    # Le glyphe de la cellule DPS reflète l'état réel de l'overlay : posé,
+    # transparent, il est parfois invisible à l'écran, et c'est alors le seul
+    # indice qu'il est toujours ouvert.
     def _reflect_overlay_state(self, char_id):
-        """Set the row's DPS glyph: ○ closed, ◉ placed (set), ✜ move mode."""
+        """Met à jour le glyphe DPS de la ligne : ○ fermé, ◉ posé, ✜ déplaçable.
+
+        Posé, l'overlay est transparent et parfois invisible à l'écran : ce
+        glyphe est alors le seul indice qu'il est toujours ouvert.
+        """
         if char_id not in self._rows:
             return
         ov = self._overlays.get(char_id)
@@ -4985,20 +6099,24 @@ class MainUI:
                 if ov.w.winfo_exists():
                     glyph = "◉" if ov.locked else "✜"
             except Exception:
-                pass
+                _log_exc("MainUI._reflect_overlay_state:5020")
         try:
             self._tv_set(char_id, "dps", glyph)
         except Exception:
-            pass
+            _log_exc("MainUI._reflect_overlay_state:5024")
 
     def _on_row_motion(self, event):
-        """Show hand cursor when hovering over a data row."""
+        """Curseur main au survol d'une ligne : rien d'autre n'indique qu'elle est
+        cliquable."""
         region = self._tree.identify_region(event.x, event.y)
         self._tree.configure(cursor="hand2" if region == "cell" else "")
 
     def _resize_char_col(self):
-        """Make the CHARACTER column fill all space left by the fixed columns
-        (using their CURRENT widths, so user-resized columns are respected)."""
+        """Étire la colonne CHARACTER sur toute la place laissée par les colonnes fixes.
+
+        Calculé sur leur largeur COURANTE et non sur les valeurs par défaut, pour
+        respecter les colonnes que l'utilisateur a lui-même redimensionnées.
+        """
         if not self._tree:
             return
         tv_w  = self._tree.winfo_width() or self.MAIN_W
@@ -5011,7 +6129,7 @@ class MainUI:
         self._tree.column("char", width=char_w)
 
     def _restore_col_widths(self):
-        """Apply saved per-column widths for the fixed columns (if any)."""
+        """Réapplique les largeurs de colonnes enregistrées, s'il y en a."""
         saved = self.cfg.get("main_ui", {}).get("col_widths", {})
         if not saved or not self._tree:
             return
@@ -5021,11 +6139,14 @@ class MainUI:
                 try:
                     self._tree.column(col, width=w)
                 except Exception:
-                    pass
+                    _log_exc("MainUI._restore_col_widths:5056")
 
     def _save_col_widths(self, event=None):
-        """Persist fixed-column widths after the user drags a header separator
-        (only writes config when a width actually changed)."""
+        """Enregistre les largeurs après un glissé de séparateur d'en-tête.
+
+        N'écrit la config que si une largeur a réellement changé : l'événement
+        se déclenche aussi à des moments où rien n'a bougé.
+        """
         if not self._tree:
             return
         try:
@@ -5036,9 +6157,52 @@ class MainUI:
                 mui["col_widths"] = widths
                 save_config(self.cfg)
         except Exception:
-            pass
+            _log_exc("MainUI._save_col_widths:5071")
 
-    # ── Clipboard / loot polling (one read for the whole fleet) ──────
+    # ── Verrou de presse-papiers ─────────────────────────────────────────
+    # Propriétaire de l'état partagé : la MainUI possède le drapeau global, son
+    # propre glyphe et les boutons CLIP de chaque fenêtre de personnage. Tous
+    # affichent LE MÊME état, donc un seul point d'entrée les rafraîchit.
+    def _set_clip_lock(self, on):
+        global _CLIP_LOCK
+        on = bool(on)
+        if on == _CLIP_LOCK:
+            return
+
+        # Déverrouillage : le texte qui a JUSTIFIÉ le verrou est toujours dans le
+        # presse-papiers. _last_clipboard ne le contient pas, puisqu'on n'a rien
+        # lu pendant le verrou — sans cet instantané, le tout premier tour après
+        # la reprise l'avalerait comme du butin et le verrou n'aurait servi à
+        # rien. C'est le détail qui porte toute la fonctionnalité.
+        if not on and _CLIP_OK:
+            try:
+                self._last_clipboard = pyperclip.paste() or ""
+            except Exception:
+                # Lecture impossible : on laisse le traqueur tel quel plutôt que
+                # de l'effacer, ce qui serait le pire des deux mondes.
+                _log_exc("MainUI._set_clip_lock:5820")
+
+        _CLIP_LOCK = on
+        self._refresh_clip_btn()
+        for win in list(self._windows.values()):
+            try:
+                win._refresh_clip_btn()
+            except Exception:
+                _log_exc("MainUI._set_clip_lock:5828")
+
+    def _refresh_clip_btn(self):
+        """Aligne le glyphe d'en-tête sur l'état du verrou."""
+        if not self._clip_btn:
+            return
+        try:
+            if _CLIP_LOCK:
+                self._clip_btn.config(text="⊘", fg=CS)
+            else:
+                self._clip_btn.config(text="▤", fg=CI)
+        except Exception:
+            _log_exc("MainUI._refresh_clip_btn:5840")
+
+    # ── Presse-papiers : une lecture pour toute la flotte ────────────────
     def _poll_clipboard(self):
         """Read the Windows clipboard ONCE per tick and offer it to the fleet.
 
@@ -5048,31 +6212,36 @@ class MainUI:
         every other app trying to copy. The dedupe tracker (_last_clipboard) was
         already shared here; now the read itself is too.
         """
-        if _CLIP_OK and self._windows:
+        # Verrou armé : on ne lit MÊME PAS le presse-papiers. Sauter la lecture
+        # plutôt que le seul ajout évite en prime de prendre le verrou global
+        # Windows à chaque tour, donc de gêner la copie que le joueur est
+        # précisément en train de faire.
+        if _CLIP_OK and self._windows and not _CLIP_LOCK:
             try:
                 content = pyperclip.paste()
             except Exception:
                 content = None
             if content and "\t" in content and content != self._last_clipboard:
-                # Hand it to the first eligible window. If none takes it (none
-                # running, or the only candidate is mid-lookup), _last_clipboard
-                # stays put so the paste is retried on a later tick.
+                # Proposé à la première fenêtre éligible. Si aucune ne le prend (aucune en
+                # cours, ou la seule candidate est déjà occupée), _last_clipboard reste
+                # inchangé et le collage sera repris à un tour suivant.
                 for win in list(self._windows.values()):
                     try:
                         if win._accept_clipboard(content):
                             self._last_clipboard = content
                             break
                     except Exception:
-                        pass
-        # Read poll_ms live: the Settings dialog writes it straight into the
-        # shared cfg dict, so a value cached at construction would go stale.
+                        _log_exc("MainUI._poll_clipboard:5098")
+        # poll_ms est relu à chaque tour : la fenêtre de réglages l'écrit directement
+        # dans le dictionnaire de config partagé, donc une valeur mise en cache à la
+        # construction deviendrait périmée.
         try:
             delay = max(100, int(self.cfg.get("poll_ms", DEF_POLL)))
         except Exception:
             delay = DEF_POLL
         self._clip_job = self.root.after(delay, self._poll_clipboard)
 
-    # ── Live stats update + frozen detection ─────────────────────────
+    # ── Totaux de flotte et détection de blocage ─────────────────────────
     def _lset(self, lbl, text=None, fg=None):
         """Update a label only when its value changed.
 
@@ -5091,6 +6260,12 @@ class MainUI:
             self._label_vals[lid] = {**prev, **opts}
             lbl.config(**opts)
 
+    # Deux rôles à la fois : agréger les totaux de flotte et SURVEILLER chaque
+    # fenêtre. Une fenêtre dont la boucle s'est arrêtée continuerait d'afficher
+    # ses derniers chiffres, indiscernables de chiffres à jour — d'où la
+    # comparaison d'horodatage qui bascule la ligne en « NO TICK ».
+    # Les totaux ne s'affichent qu'à partir de deux pilotes actifs : à un seul,
+    # ils répéteraient sa propre ligne.
     def _health_check(self):
         now       = time.monotonic()
         fleet_net = 0.0
@@ -5106,7 +6281,9 @@ class MainUI:
             suspended = getattr(win, "_suspended", False)
             vis       = win.root.winfo_viewable()
 
-            # Suspended (hidden + bg_monitor OFF): show last earned, mark offline
+            # Suspendu (masqué et surveillance de fond éteinte) : on affiche le dernier
+            # gain connu et on marque la ligne hors ligne, pour ne pas laisser croire que
+            # des chiffres figés sont à jour.
             if suspended:
                 d       = win.data
                 net_tot = d.bg * (1 - d.tax) + d.loot_val
@@ -5116,8 +6293,8 @@ class MainUI:
                 self._tv_set(char_id, "session", fdur(d.acc_sec) if d.acc_sec > 0 else "00:00:00")
                 continue
 
-            # Hidden but still monitored (bg_monitor ON): fall through to live data display below.
-            # vis=False already causes _tv_tag to use the dimmed/hidden style.
+            # Masqué mais toujours surveillé : on poursuit vers l'affichage des données en
+            # direct. vis=False suffit à faire choisir le style atténué par _tv_tag.
 
             frozen = (now - getattr(win, "_last_tick_wall", now)) > 1.5
             if frozen:
@@ -5161,7 +6338,11 @@ class MainUI:
 
         self._health_job = self.root.after(500, self._health_check)
 
-    # ── Show / hide a character window ───────────────────────────────
+    # ── Affichage d'une fenêtre de personnage ────────────────────────────
+    # Masquer une fenêtre ne l'arrête pas forcément : avec la surveillance en
+    # arrière-plan, ou tant qu'un overlay DPS est ouvert, l'analyse continue.
+    # Sinon le personnage est SUSPENDU, ce qui économise sa lecture de log —
+    # c'est le seul moyen de garder l'app légère avec beaucoup de pilotes.
     def _toggle_window(self, char_id: str):
         win = self._windows.get(char_id)
         if not win or not win.root.winfo_exists():
@@ -5171,7 +6352,9 @@ class MainUI:
         bg_monitor = self.cfg.get("bg_monitor", False)
 
         if win.root.winfo_viewable():
-            # HIDE — withdraw main + all detached panels (keep widgets alive for _tick)
+            # MASQUER : on retire la fenêtre principale et tous les panneaux détachés, en
+            # gardant les widgets VIVANTS — _tick continue de les mettre à jour, donc
+            # réafficher est instantané et rien n'est perdu.
             panels = [("isk", "_isk_window"),
                       ("msn", "_msn_window"), ("anom", "_anom_window"),
                       ("alert", "_alert_window")]
@@ -5184,7 +6367,7 @@ class MainUI:
                     try:
                         dw.w.withdraw()
                     except Exception:
-                        pass
+                        _log_exc("MainUI._toggle_window:5219")
             win._hidden_detached = was_detached
             win.root.withdraw()
             char_cfg["show"] = False
@@ -5197,7 +6380,8 @@ class MainUI:
                 self._tv_cache.pop((char_id, "__tag__"), None)
                 self._tv_tag(char_id, "standby", False)
         else:
-            # SHOW — restore main window and all panels that were visible before hide
+            # AFFICHER : on restaure la fenêtre et uniquement les panneaux qui étaient
+            # visibles avant le masquage, pas tous.
             win.root.deiconify()
             win.root.lift()
             panels = [("isk", "_isk_window"),
@@ -5211,7 +6395,7 @@ class MainUI:
                             dw.w.deiconify()
                             dw.w.lift()
                         except Exception:
-                            pass
+                            _log_exc("MainUI._toggle_window:5246")
             win._hidden_detached = []
             char_cfg["show"] = True
             win._suspended = False         # resume log reading
@@ -5221,7 +6405,9 @@ class MainUI:
         
         save_config(self.cfg)
 
-    # ── Called by CharacterWindow._quit() when a window closes itself ─
+    # ── Rappel de fermeture d'une fenêtre ────────────────────────────────
+    # Une fenêtre qui se ferme elle-même doit le SIGNALER : sans ça, le hub
+    # garderait une référence morte et continuerait de l'interroger.
     def _on_char_closed(self, char_id: str):
         self._windows.pop(char_id, None)
         self._rows.pop(char_id, None)
@@ -5229,12 +6415,13 @@ class MainUI:
             try:
                 self._tree.delete(char_id)
             except Exception:
-                pass
-            # purge cache entries for this char
+                _log_exc("MainUI._on_char_closed:5264")
+            # purge les entrées de cache de ce personnage, sinon elles s'accumuleraient
+            # pour des fenêtres qui n'existent plus
             for k in [k for k in self._tv_cache if k[0] == char_id]:
                 del self._tv_cache[k]
 
-    # ── Resize grip ──────────────────────────────────────────────────
+    # ── Poignée de redimensionnement ─────────────────────────────────────
     def _resize_start(self, e):
         self._rw = self.root.winfo_width()
         self._rh = self.root.winfo_height()
@@ -5260,6 +6447,8 @@ class MainUI:
         self._main_last_w = w
         self._resize_char_col()
 
+    # Repli sur la barre de titre, comme pour les fenêtres de personnage : la
+    # vue d'ensemble reste accessible sans occuper l'écran pendant le jeu.
     def _toggle_collapse(self, event=None):
         if getattr(self, "_dragging", False):
             return
@@ -5292,21 +6481,21 @@ class MainUI:
             mui["full_height"] = self._full_height
             save_config(self.cfg)
 
-    # ── Settings ─────────────────────────────────────────────────────
+    # ── Réglages ─────────────────────────────────────────────────────────
     def _settings(self):
         if self._settings_win and self._settings_win.winfo_exists():
             self._settings_win.lift()
             return
         self._settings_win = MainUISettings(self.root, self).w
 
-    # ── Fleet Manager ─────────────────────────────────────────────────
+    # ── Gestionnaire de flotte ───────────────────────────────────────────
     def _fleet_manager(self):
         if self._fleet_mgr_win and self._fleet_mgr_win.winfo_exists():
             self._fleet_mgr_win.lift()
             return
         self._fleet_mgr_win = FleetManager(self.root, self).w
 
-    # ── Geometry ─────────────────────────────────────────────────────
+    # ── Géométrie de la fenêtre ──────────────────────────────────────────
     def _save_pos(self):
         try:
             mui = self.cfg.setdefault("main_ui", {})
@@ -5317,8 +6506,10 @@ class MainUI:
                     mui["full_height"] = h
             save_config(self.cfg)
         except Exception:
-            pass
+            _log_exc("MainUI._save_pos:5352")
 
+    # La largeur est bornée au minimum : une géométrie enregistrée par une
+    # version antérieure, ou tronquée, rendrait les colonnes illisibles.
     def _restore_geometry(self):
         saved = self.cfg.get("main_ui", {}).get("geometry", "")
         if saved:
@@ -5326,7 +6517,12 @@ class MainUI:
         else:
             self.root.geometry(f"{self.MAIN_W}x300+10+80")
 
-    # ── System tray (single icon for the whole app) ──────────────────
+    # ── Zone de notification (une icône pour toute l'app) ────────────────
+    # UNE icône pour l'app entière, pas une par personnage : cinq pilotes
+    # rempliraient la zone de notification. Optionnelle — sans pystray, on perd
+    # seulement la possibilité de réduire dans la barre.
+    # pystray tourne sur son propre thread, donc ses actions doivent repasser
+    # par la boucle Tk plutôt que toucher les widgets directement.
     def _init_tray_icon(self):
         try:
             icon_img = None
@@ -5353,6 +6549,9 @@ class MainUI:
     def _tray_show(self, icon=None, item=None):
         self.root.after(0, self._tray_restore)
 
+    # Restaure la vue d'ensemble ET les fenêtres qui étaient visibles avant la
+    # réduction : rétablir tout le monde ferait réapparaître des pilotes que le
+    # joueur avait délibérément masqués.
     def _tray_restore(self):
         self.root.deiconify()
         self.root.lift()
@@ -5372,17 +6571,22 @@ class MainUI:
                             dw.w.deiconify()
                             dw.w.lift()
             except Exception:
-                pass
+                _log_exc("MainUI._tray_restore:5407")
 
     def _tray_exit(self, icon=None, item=None):
         if self._tray_icon:
             try:
                 self._tray_icon.stop()
             except Exception:
-                pass
+                _log_exc("MainUI._tray_exit:5414")
         self.root.after(0, self._quit)
 
-    # ── Quit all ─────────────────────────────────────────────────────
+    # ── Fermeture de l'application ───────────────────────────────────────
+    # Fermeture ordonnée, et l'ORDRE compte : on annule d'abord les boucles,
+    # puis on arrête l'observateur de fichiers et l'icône (qui vivent sur
+    # d'autres threads), et seulement ensuite on détruit les fenêtres — chacune
+    # archivant sa session au passage. Détruire d'abord ferait se déclencher les
+    # boucles sur des widgets disparus.
     def _quit(self):
         if self._health_job:
             self.root.after_cancel(self._health_job)
@@ -5398,24 +6602,24 @@ class MainUI:
             try:
                 obs.stop(); obs.join(timeout=2.0)
             except Exception:
-                pass
+                _log_exc("MainUI._quit:5433")
             self._log_observer = None
         self._save_pos()
         if self._tray_icon:
             try:
                 self._tray_icon.stop()
             except Exception:
-                pass
+                _log_exc("MainUI._quit:5440")
         for ov in list(self._overlays.values()):
             try:
                 ov.close()
             except Exception:
-                pass
+                _log_exc("MainUI._quit:5445")
         for win in list(self._windows.values()):
             try:
                 win._quit()
             except Exception:
-                pass
+                _log_exc("MainUI._quit:5450")
         if self.root.winfo_exists():
             self.root.destroy()
 

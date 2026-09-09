@@ -13,7 +13,7 @@ It does NOT touch the EVE client, network traffic or memory.
  1. WHAT YOU NEED
 ----------------------------------------------------------------
 
-  - Windows 10/11  (or Linux — see section 11)
+  - Windows 10/11  (or Linux — see section 21)
   - Python 3.9 or newer    (https://www.python.org/downloads/)
     -> During install, tick "Add Python to PATH"
   - The EVE Online client (gamelogs are enabled by default)
@@ -31,15 +31,17 @@ It does NOT touch the EVE client, network traffic or memory.
  2. MAKE SURE EVE IS LOGGING
 ----------------------------------------------------------------
 
-  EVE writes logs to:
+  EVE writes the logs this app reads to:
     %USERPROFILE%\Documents\EVE\logs\Gamelogs
-    %USERPROFILE%\Documents\EVE\logs\Chatlogs
 
-  Both folders should already exist after logging in at least
-  once. If they are empty:
+  The folder should already exist after logging in at least
+  once. If it is empty:
 
   In the EVE client, open ESC → Settings and confirm that
-  "Log combat interactions to file" and chat logging are enabled.
+  "Log combat interactions to file" is enabled.
+
+  Eve Ratting does NOT read your chat logs. Everything it
+  needs is in the gamelog.
 
 ----------------------------------------------------------------
  3. RUNNING EVE RATTING
@@ -109,9 +111,11 @@ It does NOT touch the EVE client, network traffic or memory.
     - When shown again, polling resumes from where it left off
 
   Header buttons:
-    ◈   Fleet Manager (add/remove characters from the fleet)
-    ⚙   Global Settings (paths, tax, opacity, theme)
-    ✕   Quit all windows
+    ▤ / ⊘  Clipboard lock (see §13). Green ▤ = the clipboard is
+           being read; red ⊘ = reading is locked off.
+    ◈      Fleet Manager (add/remove characters from the fleet)
+    ⚙      Global Settings (paths, tax, opacity, theme)
+    ✕      Quit all windows
 
   Double-click the title bar to collapse the overview to just
   its header bar. Drag the bottom-right grip to resize the
@@ -177,11 +181,12 @@ It does NOT touch the EVE client, network traffic or memory.
   Each character gets its own always-on-top window. Sections
   from top to bottom:
 
-  CONTROLS      Play / Pause / Stop / Reset / Next Site buttons
+  CONTROLS      Play / Pause / Stop / Reset / Next Site / Clip
   ALERTS        EWAR / escalation / loot feed (with CLR button)
   ISK TRACKER   ISK/hour + session timer + breakdown
-  MISSIONS      Mission name, objective status, mission count,
-                storyline progress (or ANOMALY TRACKER — see §11)
+  MISSIONS      Objective status, mission count, storyline
+                progress (or ANOMALY TRACKER — see §12).
+                The mission NAME is never shown — see §11.
 
   (Live DPS is no longer a dashboard section — it now lives in
   the standalone DPS overlay, opened from the overview's DPS
@@ -210,14 +215,22 @@ It does NOT touch the EVE client, network traffic or memory.
   ⏸  PAUSE      Freeze the timer without losing any data.
                 Parsing continues so no events are missed.
 
-  ■  STOP       Save the current session to history and halt.
+  ■  STOP       Freeze the display and halt parsing.
+                It does NOT write to history. The session is
+                saved on RESET, NEXT SITE, or when you quit.
 
-  RESET         Save the session, then immediately start a fresh
-                new session (timer resets to zero).
+  RESET         Save the session to history, then wipe it and
+                start fresh (timer back to 00:00, all counters
+                back to zero).
 
-  NEXT SITE     Close the current anomaly site, save the session
-                data, and reset — convenient for back-to-back
-                sites without leaving the dashboard.
+  NEXT SITE     Identical to RESET. Same code, different label.
+                READ §12 BEFORE USING IT — it ends your session,
+                it does not advance to the next site within one.
+
+  CLIP          Lock or unlock clipboard reading (see §13).
+                Green CLIP = live, red CLIP ⊘ = locked.
+                The lock is GLOBAL across the whole fleet, and
+                every window's button shows the same state.
 
 ----------------------------------------------------------------
  9. ISK TRACKER
@@ -227,54 +240,31 @@ It does NOT touch the EVE client, network traffic or memory.
   SESSION       Time elapsed since Play was pressed
 
   The collapsible BREAKDOWN sub-section shows:
-    BOUNTIES    Gross bounty payouts
-    TAX         Tax withheld (configurable %)
-    LOOT        Clipboard-pasted loot value (see §10)
-    NET ISK     Bounties − tax + loot
+    BOUNTIES            Gross bounty payouts
+    EST. TAXES          Tax withheld (configurable %)
+    KILLS               NPC kills credited this session
+    LOOT ESTIMATE       Clipboard-valued loot (see §13)
+    TOTAL NET (+LOOT)   Bounties − tax + loot
 
-  Hover over the TAX value to see the exact ISK amount withheld.
+  Hover over the EST. TAXES value to see the exact rate used.
 
-----------------------------------------------------------------
- 10. MISSIONS TRACKER
-----------------------------------------------------------------
+  UNDO          Small button under the LOOT ESTIMATE value.
+                Removes the LAST loot import from this
+                character's session — the amount comes back off
+                the total, and its line disappears from the
+                ALERTS feed.
 
-  Reads the EVE chatlog to detect:
-    - Mission accepted (name from agent conversation log)
-    - Objective accomplished
-    - Mission completed (counter + storyline progress)
-    - Faction standing changes
+                It is repeatable: press it again to remove the
+                one before that, and so on. It is greyed out
+                when there is nothing left to undo, and is
+                refused while an estimate is still being priced.
 
-  STORYLINE progress counts toward the next storyline mission
-  (every 16 regular missions).
-
-  The MISSIONS section and the ANOMALY TRACKER (§11) are mutually
-  exclusive — only one can be active at a time.
-
-----------------------------------------------------------------
- 11. ANOMALY TRACKER
-----------------------------------------------------------------
-
-  Automatically segments your ratting into discrete sites using
-  combat gaps. When no combat is detected for SITE GAP seconds
-  (default 45 s, configurable in Settings), the current site is
-  considered complete.
-
-  Displays:
-    CURRENT     Time spent in the active site
-    COMPLETED   Number of sites finished this session
-    AVG TIME    Average site completion time
-    AVG ISK     Average ISK per site
-    BEST ISK    Highest single-site ISK
-
-  Use NEXT SITE in the controls bar to force-close the current
-  site and immediately start the next one.
-
-  Note: enable ANOMALY TRACKER by toggling it ON in its section
-  header. This will automatically disable MISSIONS (they are
-  mutually exclusive).
+                The undo list is cleared whenever the session is
+                saved (RESET / NEXT SITE / quit) — once a session
+                is in the history file, its imports are final.
 
 ----------------------------------------------------------------
- 12. LOOT ESTIMATION (CLIPBOARD)
+ 10. LOOT ESTIMATION (CLIPBOARD)
 ----------------------------------------------------------------
 
   Requires pyperclip (pip install pyperclip).
@@ -293,8 +283,190 @@ It does NOT touch the EVE client, network traffic or memory.
     - Universe average price for all other items (24 h cached)
     - Offline fallback table if ESI is unavailable
 
+  The app values ANY tab-separated clipboard text, because that
+  is what an EVE inventory copy looks like. A contract window, a
+  market row, or a spreadsheet cell range can therefore be picked
+  up as loot by accident. Two features exist for that: the
+  clipboard lock (§13) to prevent it, and UNDO (§9) to fix it
+  after the fact.
+
 ----------------------------------------------------------------
- 13. ALERTS FEED
+ 11. MISSIONS TRACKER
+----------------------------------------------------------------
+
+  Reads the gamelog to detect:
+    - Objective accomplished
+    - Mission completed (counter + storyline progress)
+    - Faction standing changes
+
+  The NAME of the current mission is not shown. EVE writes it
+  to no log file at all — an agent conversation is not a chat
+  channel and produces no log — so no log reader can know it.
+  The MISSION row therefore stays on "— None —".
+
+  STORYLINE progress counts toward the next storyline mission
+  (every 16 regular missions). This is the main reason the
+  section exists: the client tells you nothing about where
+  you are in that cycle.
+
+  The MISSIONS section and the ANOMALY TRACKER (§12) are mutually
+  exclusive — only one can be active at a time.
+
+----------------------------------------------------------------
+ 12. ANOMALY TRACKER  —  AND "SITE GAP vs NEXT SITE"
+----------------------------------------------------------------
+
+  Enable it by toggling ANOMALY TRACKER ON in its section
+  header. This automatically disables MISSIONS (§11), since the
+  two are mutually exclusive.
+
+  Displays:
+    CURRENT SITE        Time spent in the active site
+    CLEARED             Sites finished this session
+    AVG TIME            Average site completion time
+    AVG ISK             Average BOUNTY ISK per site
+    BEST ISK            Highest single-site bounty ISK
+    RUN LOOT            Loot valued this session (see below)
+    ISK / SITE (+LOOT)  Session net INCLUDING loot, per site
+
+  ****************************************************************
+  *  SITE GAP vs NEXT SITE — READ THIS ONE                       *
+  ****************************************************************
+
+  Both have "site" in the name. They do COMPLETELY DIFFERENT
+  things, and mixing them up is the most common mistake.
+
+  --- SITE GAP : automatic, harmless -----------------------------
+
+  A SETTING (Settings ▸ SITE GAP, default 45 seconds).
+
+  The tracker watches for silence in the combat log. Once
+  SITE GAP seconds pass with no combat, it decides the current
+  site is finished; the next combat line starts a new one.
+
+  That is the entire mechanism. EVE never announces that you
+  entered or left an anomaly, so silence is the only signal
+  available to a log reader.
+
+  WHAT IT TOUCHES:
+    Only the anomaly counters — CURRENT SITE, CLEARED,
+    AVG TIME, AVG ISK, BEST ISK.
+
+  WHAT IT DOES NOT TOUCH:
+    Your session. The timer, bounties, loot, kills and ISK/hour
+    all keep running untouched. Nothing is written to history.
+
+  Tune it if sites split or merge wrongly:
+    - one site becoming two   -> RAISE the value
+    - two sites becoming one  -> LOWER the value
+  Raise it if you regularly take long breaks mid-site (reloading
+  drones, waiting on a spawn, warping out and back).
+
+  --- NEXT SITE : manual, and it ENDS YOUR SESSION ---------------
+
+  A BUTTON, and far heavier than the name suggests.
+
+  NEXT SITE IS FUNCTIONALLY IDENTICAL TO RESET. It is literally
+  the same code path with a different label. Pressing it will:
+
+    1. Close the current anomaly
+    2. SAVE the whole session to history (one history row)
+    3. WIPE EVERYTHING:
+         timer      -> 00:00
+         bounties   -> 0
+         loot       -> 0
+         kills      -> 0
+         CLEARED / AVG TIME / AVG ISK / BEST ISK -> 0
+
+  It does NOT "move to the next site" inside a running session.
+  It ends the session and starts a brand new one.
+
+  --- WHICH ONE DO I WANT? ---------------------------------------
+
+  Per-site averages building up over a whole evening
+      -> Let SITE GAP do the splitting. NEVER press NEXT SITE.
+
+  One history row per site
+      -> Press NEXT SITE after each site.
+
+  MTU / salvage runs
+      -> Do NOT press NEXT SITE until you have salvaged and
+         copied the loot. See below.
+
+  --- THE MTU TRAP -----------------------------------------------
+
+  The common haven workflow: clear a site, drop an MTU, warp to
+  the next, repeat for several sites, then come back with a
+  salvager and collect every MTU in one pass.
+
+  ONE RULE: leave the session running for the whole run.
+
+  The salvage arrives as a SINGLE cargo covering every site.
+  Whichever session is running when you paste it receives the
+  entire amount. Press NEXT SITE between havens and you end up
+  with four history rows — three showing zero loot, and the
+  fourth showing all of it.
+
+  Leave the session alone and SITE GAP still counts your four
+  sites correctly. The tracker then gives you:
+
+    RUN LOOT            the whole salvage haul for the run
+    ISK / SITE (+LOOT)  session net including that loot,
+                        divided across the sites you ran
+
+  Note that AVG ISK deliberately stays BOUNTY-ONLY. One MTU
+  cargo covering four sites genuinely cannot be attributed site
+  by site — that information does not exist anywhere — so the
+  loot is reported at run level and the division is presented as
+  an average rather than invented per site.
+
+  The two numbers side by side are the point:
+    AVG ISK             what the rats paid you, per site
+    ISK / SITE (+LOOT)  what the site was actually worth
+
+----------------------------------------------------------------
+ 13. CLIPBOARD LOCK (CLIP)
+----------------------------------------------------------------
+
+  Loot estimation works by watching the Windows clipboard, and
+  it values ANY tab-separated text (§10). That is convenient
+  until you want to copy something else while ratting — a
+  fitting, a contract, or your own cargo to paste into an
+  external appraisal site. Without a lock, that copy lands in
+  your loot total.
+
+  CLIP stops the app reading the clipboard at all.
+
+    Where       The CONTROLS bar of every character window
+                (next to RESET / NEXT SITE), and the ▤ / ⊘
+                glyph in the RATTING OVERVIEW header.
+
+    State       Green CLIP  / green ▤  = clipboard is live
+                Red CLIP ⊘  / red  ⊘   = locked, nothing read
+
+  The lock is GLOBAL — the clipboard is read once for the whole
+  fleet, so locking from any window locks everywhere, and every
+  button shows the same state.
+
+  While locked, the ISK breakdown header changes from
+  "LOOT ESTIMATE (CTRL+C)" to "LOOT ESTIMATE (LOCKED)" in red,
+  so you cannot forget it is on. Your running loot total stays
+  visible — you usually lock precisely because you are handling
+  loot.
+
+  When you unlock, whatever is currently in the clipboard is
+  deliberately ignored, so the very text you locked for is not
+  swallowed the moment you resume. Copy the cargo again to
+  actually import it.
+
+  The lock is NEVER saved between runs. The app always starts
+  unlocked, so a lock you forgot about dies with the app instead
+  of silently costing you a whole evening of loot tracking.
+
+  If something did get counted before you locked, use UNDO (§9).
+
+----------------------------------------------------------------
+ 14. ALERTS FEED
 ----------------------------------------------------------------
 
   The ALERTS section shows up to 5 recent events:
@@ -308,8 +480,10 @@ It does NOT touch the EVE client, network traffic or memory.
   The panel flashes briefly on new EWAR events.
   Press CLR to clear all alerts.
 
+  Undoing a loot import (§9) also removes its LOOT line here.
+
 ----------------------------------------------------------------
- 14. DETACHED PANELS
+ 15. DETACHED PANELS
 ----------------------------------------------------------------
 
   Click the ↱ button on any section header to pop it out into
@@ -325,21 +499,23 @@ It does NOT touch the EVE client, network traffic or memory.
   standalone overlay instead; see "THE DPS OVERLAY" in §5.)
 
 ----------------------------------------------------------------
- 15. SETTINGS
+ 16. SETTINGS
 ----------------------------------------------------------------
 
-  Open Settings from the ⚙ button in the Overview header,
-  or from the character window header.
+  Open Settings from the ⚙ button in the Overview header.
 
   GAMELOGS PATH     Path to EVE\logs\Gamelogs
-  CHATLOGS PATH     Path to EVE\logs\Chatlogs
-  UPDATE INTERVAL   Log polling rate in milliseconds (default 250)
   OPACITY %         Window transparency 20–100 % (default 85 %)
                     All open windows update live, including the
                     Settings and Fleet Manager windows themselves.
   CORP TAX %        Bounty tax rate for net ISK calculation
-  SITE GAP (sec)    Seconds of no combat = end of anomaly site
+  UPDATE INTERVAL   Log polling rate in milliseconds (default 250)
+  SITE GAP (sec)    Seconds of combat silence that end an anomaly
+                    site. Affects ONLY the anomaly counters — it
+                    never touches your session. See §12.
   THEME             22+ EVE / faction palettes
+  BACKGROUND        Keep parsing for characters whose window is
+   MONITORING       hidden, instead of suspending them
 
   Themes are applied live — the window recolours in place with
   no flicker. Theme is saved per character.
@@ -347,13 +523,18 @@ It does NOT touch the EVE client, network traffic or memory.
   Settings are stored in ratting_config.json next to the script.
 
 ----------------------------------------------------------------
- 16. HISTORY
+ 17. HISTORY
 ----------------------------------------------------------------
 
-  Each STOP or RESET saves a row to ratting_history.json:
+  Each RESET, NEXT SITE or quit saves a row to
+  ratting_history.json (STOP alone does not — see §8):
     date, character, duration, gross ISK, net ISK, loot value,
     ISK/h, kills, damage dealt/received, peak DPS in/out,
     missions done, sites cleared, avg/best site time and ISK
+
+  A session that earned nothing at all (no bounties, no damage,
+  no loot) is not written — opening the app to look at it and
+  closing again does not pollute your history.
 
   Click the ☰ icon in a character window's title bar to open
   the History popup for that character. It shows:
@@ -365,7 +546,7 @@ It does NOT touch the EVE client, network traffic or memory.
   history (other characters are unaffected).
 
 ----------------------------------------------------------------
- 17. SYSTEM TRAY (OPTIONAL)
+ 18. SYSTEM TRAY (OPTIONAL)
 ----------------------------------------------------------------
 
   If pystray and Pillow are installed, closing a character
@@ -376,7 +557,7 @@ It does NOT touch the EVE client, network traffic or memory.
   back into the Overview list.
 
 ----------------------------------------------------------------
- 18. TROUBLESHOOTING
+ 19. TROUBLESHOOTING
 ----------------------------------------------------------------
 
   "No character windows appear"
@@ -390,21 +571,41 @@ It does NOT touch the EVE client, network traffic or memory.
        killmail. Pure logi/booster characters will not see
        bounties.
 
-  "Mission name not detected"
-    -> Eve Ratting reads chatlogs for agent conversations.
-       Check the Chatlogs path in Settings and confirm that
-       "Agent_*.txt" files exist for your character.
+  "Mission name is always - None -"
+    -> Expected, and not fixable. EVE never writes the mission
+       name to disk, so there is nothing to read. Objective
+       status, mission count and storyline progress do work.
 
   "Loot value is 0 after paste"
     -> Confirm pyperclip is installed.
     -> Copy the inventory with Ctrl+A then Ctrl+C inside EVE.
+    -> Check the CLIP button is not red — a locked clipboard
+       is not read at all (§13).
     -> ESI may be temporarily down; the offline fallback table
        will be used instead.
+
+  "Something I copied got counted as loot"
+    -> Press UNDO under the LOOT ESTIMATE value (§9). Press it
+       repeatedly to remove earlier imports.
+    -> To prevent it next time, press CLIP before copying, and
+       press it again afterwards (§13).
+
+  "My MTU run turned into 4 history rows and only the last
+   one has any loot"
+    -> You pressed NEXT SITE between sites. It ends the session
+       rather than advancing within it. Leave the session
+       running for the whole run — SITE GAP still counts the
+       sites for you. See §12.
 
   "Anomaly sites are not being split correctly"
     -> Adjust SITE GAP in Settings. Increase it if a single
        site is being split into multiple; decrease it if two
-       sites are being merged into one.
+       sites are being merged into one. This is independent of
+       the NEXT SITE button (§12).
+
+  "AVG ISK looks too low compared with ISK / SITE"
+    -> Expected. AVG ISK counts bounties only. ISK / SITE
+       (+LOOT) includes loot. See §12.
 
   "Theme colours look wrong"
     -> Select "EVE Online (Default)" in Settings to reset.
@@ -419,7 +620,36 @@ It does NOT touch the EVE client, network traffic or memory.
        traceback, then open a GitHub issue with it.
 
 ----------------------------------------------------------------
- 19. LINUX
+ 20. DEBUG LOG (WHEN SOMETHING FAILS SILENTLY)
+----------------------------------------------------------------
+
+  Eve Ratting deliberately swallows errors instead of crashing:
+  a panel that fails to redraw must never take the whole overlay
+  down while you are in a site. The downside is that problems
+  are invisible, so there is a switch to record them.
+
+  Turn it on either way:
+
+    - Set the environment variable EVE_RATTING_DEBUG=1
+        Windows : set EVE_RATTING_DEBUG=1
+        Linux   : export EVE_RATTING_DEBUG=1
+
+    - Or add  "debug_log": true  to ratting_config.json
+      (easier with the packaged .exe, where setting an
+       environment variable is awkward)
+
+  Failures are then appended to ratting_debug.log next to
+  ratting.py, each with a timestamp, the function it came from,
+  and a full traceback.
+
+  The file is capped at 512 KB and starts over past that, so it
+  cannot fill your disk. Leave it off for normal play — when
+  disabled it costs a single check and writes nothing.
+
+  Attach that file to a GitHub issue if you report a bug.
+
+----------------------------------------------------------------
+ 21. LINUX
 ----------------------------------------------------------------
 
   The app auto-detects log paths for:
@@ -430,19 +660,23 @@ It does NOT touch the EVE client, network traffic or memory.
 
   If auto-detection fails, set the path manually in Settings.
 
+  Note that the DPS overlay's transparency and click-through are
+  Windows-only, as is the audible EWAR beep (winsound).
+
 ----------------------------------------------------------------
- 20. UNINSTALL
+ 22. UNINSTALL
 ----------------------------------------------------------------
 
   Eve Ratting installs nothing system-wide. To remove it:
     1. Delete the project folder.
-    2. (Optional) pip uninstall pystray Pillow pyperclip
+    2. (Optional) pip uninstall pystray Pillow pyperclip watchdog
 
-  All settings, history and caches live next to ratting.py and
-  are removed with the folder.
+  All settings, history, caches and the debug log live next to
+  ratting.py and are removed with the folder. Nothing is written
+  to the registry, and nothing is left behind.
 
 ----------------------------------------------------------------
- 21. SUPPORT
+ 23. SUPPORT
 ----------------------------------------------------------------
 
   Issues and feature requests:
